@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Drop these entries into claude_desktop_config.json (or any MCP client config).",
+    "Each entry is one identity. The agent cannot choose which one it is - that is the",
+    "point. Run two servers if you want an agent that can act under two purposes, and",
+    "let policy decide what each one reaches.",
+    "Replace /abs/path/to/workspace with the directory 'aperture demo' created."
+  ],
+  "mcpServers": {
+    "aperture-support": {
+      "command": "aperture",
+      "args": [
+        "serve",
+        "-w", "/abs/path/to/workspace",
+        "-p", "svc_support_agent",
+        "--purpose", "customer_support"
+      ]
+    },
+    "aperture-oncall": {
+      "command": "aperture",
+      "args": [
+        "serve",
+        "-w", "/abs/path/to/workspace",
+        "-p", "u_raj",
+        "--purpose", "engineering_oncall"
+      ]
+    }
+  }
+}
