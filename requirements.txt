@@ -1,0 +1,6 @@
+# Dependencies for the Vercel playground deployment.
+# The trailing "." installs the aperture package itself from pyproject.toml.
+fastapi>=0.110
+pydantic>=2.6
+pyyaml>=6.0
+.
