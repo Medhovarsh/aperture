@@ -7,11 +7,15 @@ log, and the policy conformance suite asserts on them.
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
 
 
-class Reason(StrEnum):
-    """Why a record or source was allowed, withheld, or altered."""
+class Reason(str, Enum):
+    """Why a record or source was allowed, withheld, or altered.
+
+    Subclasses ``str`` rather than ``StrEnum`` so the package runs on Python 3.10,
+    which the project supports.
+    """
 
     # Allow
     ALLOWED = "allowed"
@@ -42,6 +46,9 @@ class Reason(StrEnum):
 
     # Infrastructure
     SOURCE_UNAVAILABLE = "source_unavailable"
+
+    def __str__(self) -> str:
+        return self.value
 
 
 HUMAN_READABLE: dict[Reason, str] = {

@@ -1,5 +1,11 @@
 # Aperture
 
+[![CI](https://github.com/Medhovarsh/aperture/actions/workflows/ci.yml/badge.svg)](https://github.com/Medhovarsh/aperture/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-stdio%20server-8A2BE2.svg)](https://modelcontextprotocol.io)
+[![Dependencies](https://img.shields.io/badge/paid%20dependencies-none-brightgreen.svg)](#)
+
 **A governed context plane for AI agents.**
 
 Agents read enterprise data through one chokepoint that knows four things at once:
