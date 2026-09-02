@@ -15,6 +15,11 @@ what the data *means*, who is *permitted* to see it, how *fresh* it is, and how 
 Runs as an MCP server. Zero paid dependencies, no model API key, no vector database,
 no cloud account. It installs inside a locked-down network.
 
+![Same question, two purposes, two different answers](docs/demo.svg)
+
+*Generated from real CLI output by `python tools/render_demo.py` - the picture cannot
+drift away from what the tool actually prints.*
+
 ---
 
 ## The problem
@@ -152,6 +157,32 @@ Aperture speaks MCP over stdio. In `claude_desktop_config.json` (or any MCP clie
 ```
 
 Tools exposed: `context_search`, `context_fetch`, `catalog_list_sources`, `access_explain`.
+
+---
+
+## Try it in a browser
+
+A hosted playground ships in the repo: pick an identity, pick a purpose, ask a question,
+and watch records appear and disappear with their reason codes, plus the live audit trail.
+
+```bash
+pip install -e ".[web]"
+uvicorn aperture.playground:app --reload
+```
+
+Deploy it anywhere that runs a Python function. For Vercel:
+
+```bash
+npm i -g vercel && vercel deploy
+```
+
+`vercel.json` and `api/index.py` are already wired; the whole app is one function.
+
+The playground deliberately does the one thing the real server refuses to do - it lets
+**you** choose which principal to act as. That is the point of a demo, and it is exactly
+why the MCP server pins identity server-side: anything a caller can choose, a prompt
+injection can choose too. All playground data is synthetic, and on a serverless host the
+audit log lives only for the life of the instance.
 
 **The identity is on the server, not in the tool call.** One server instance acts as
 exactly one principal. An agent cannot choose who it is, because anything an agent can
@@ -302,7 +333,7 @@ pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-95 tests. The two that matter most:
+104 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
 
 - **`tests/test_conformance.py`** — a policy conformance matrix asserting, for every
   (principal, purpose) pair, exactly which sources are readable. Read it as the
