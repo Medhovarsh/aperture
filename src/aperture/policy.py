@@ -10,6 +10,12 @@ Evaluation semantics:
 * **Deny overrides.** An explicit deny beats any number of allows.
 * **Redactions accumulate.** All matching redact rules contribute their fields.
 
+Action rules (v2) are kept strictly separate from read rules: a rule that names
+actions governs only actions, and a rule that does not is invisible to action
+evaluation. Read access can therefore never accumulate into permission to act.
+Action grants are alternatives - the impact limits on each grant decide which one
+covers a given proposal - while denies remain absolute.
+
 The same rule set is evaluated twice per query: once per source to decide
 eligibility, then once per candidate record. Rules that reference record-only
 dimensions are simply inert at the source stage.
@@ -39,12 +45,14 @@ class RuleMatch(BaseModel):
     tenants: tuple[str, ...] = ()
     purposes: tuple[str, ...] = ()
     sources: tuple[str, ...] = ()
+    actions: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
     sensitivity_at_least: Sensitivity | None = None
     sensitivity_at_most: Sensitivity | None = None
 
     @field_validator(
-        "principals", "groups", "tenants", "purposes", "sources", "tags", mode="before"
+        "principals", "groups", "tenants", "purposes", "sources", "actions", "tags",
+        mode="before",
     )
     @classmethod
     def _coerce(cls, v: Any) -> Any:
@@ -69,6 +77,12 @@ class Rule(BaseModel):
     reason: Reason | None = None
     description: str = ""
 
+    # Action-only controls. Ignored when the rule does not name any action.
+    requires_approval: bool = False
+    max_amount: float | None = None
+    max_affected: int | None = None
+    allow_irreversible: bool = True
+
     @field_validator("redact_fields", mode="before")
     @classmethod
     def _coerce_fields(cls, v: Any) -> Any:
@@ -87,6 +101,10 @@ class PolicyDefaults(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     stale_action: str = "tag"  # "tag" keeps the record and flags it; "drop" withholds it
+
+    #: How long an approved proposal stays executable. Short by design: an
+    #: approval is a decision about a moment, not a standing permission.
+    proposal_ttl_seconds: int = 900
 
     @field_validator("stale_action")
     @classmethod
@@ -110,6 +128,22 @@ class Verdict(BaseModel):
     def permitted(self) -> bool:
         """True when the subject may be read (possibly with redactions)."""
         return self.decision in (Decision.ALLOW, Decision.REDACT)
+
+
+class ActionVerdict(BaseModel):
+    """Result of evaluating policy for one proposed action."""
+
+    model_config = ConfigDict(frozen=True)
+
+    decision: Decision
+    reason: Reason
+    requires_approval: bool = False
+    matched_rules: tuple[str, ...] = ()
+
+    @property
+    def permitted(self) -> bool:
+        """True when the action may proceed, possibly after human approval."""
+        return self.decision is Decision.ALLOW
 
 
 class Policy(BaseModel):
@@ -203,6 +237,11 @@ class Policy(BaseModel):
         redacts: list[Rule] = []
 
         for rule in self.rules:
+            # A rule that names actions governs actions only. Read access and action
+            # authority are separate powers; letting one grant the other is exactly
+            # the privilege bleed this split exists to prevent.
+            if rule.when.actions:
+                continue
             if not self._matches(rule.when, principal, purpose, source, effective_sensitivity, tags):
                 continue
             if rule.effect is Decision.DENY:
@@ -239,6 +278,127 @@ class Policy(BaseModel):
                 matched_rules=matched,
             )
         return Verdict(decision=Decision.ALLOW, reason=Reason.ALLOWED, matched_rules=matched)
+
+    # -- action evaluation ------------------------------------------------ #
+
+    def evaluate_action(
+        self,
+        principal: Principal,
+        purpose: str,
+        action_id: str,
+        *,
+        reversible: bool,
+        amount: float = 0.0,
+        affected: int = 0,
+    ) -> ActionVerdict:
+        """Decide whether a proposed action may run.
+
+        Only rules that explicitly name actions are considered, so no amount of read
+        access can add up to permission to act.
+
+        The impact figures come from the executor's dry run, never from the agent.
+        A model that under-reports the blast radius of its own action would otherwise
+        be able to talk its way past a limit.
+        """
+        try:
+            return self._evaluate_action(
+                principal, purpose, action_id, reversible, amount, affected
+            )
+        except Exception:  # noqa: BLE001 - fail closed on any evaluation fault
+            return ActionVerdict(decision=Decision.DENY, reason=Reason.POLICY_ERROR)
+
+    def _evaluate_action(
+        self,
+        principal: Principal,
+        purpose: str,
+        action_id: str,
+        reversible: bool,
+        amount: float,
+        affected: int,
+    ) -> ActionVerdict:
+        if not self.knows_purpose(purpose):
+            return ActionVerdict(decision=Decision.DENY, reason=Reason.PURPOSE_NOT_PERMITTED)
+
+        denies: list[Rule] = []
+        allows: list[Rule] = []
+
+        for rule in self.rules:
+            if not rule.when.actions:
+                continue
+            if action_id not in rule.when.actions and "*" not in rule.when.actions:
+                continue
+            if not self._matches_identity(rule.when, principal, purpose):
+                continue
+            (denies if rule.effect is Decision.DENY else allows).append(rule)
+
+        if denies:
+            first = denies[0]
+            return ActionVerdict(
+                decision=Decision.DENY,
+                reason=first.reason or Reason.EXPLICIT_DENY,
+                matched_rules=tuple(rule.id for rule in denies),
+            )
+        if not allows:
+            return ActionVerdict(decision=Decision.DENY, reason=Reason.ACTION_NOT_PERMITTED)
+
+        # Grants are alternatives. A rule only counts if it tolerates this specific
+        # impact, so tiers are expressible: "up to 100 freely" and "up to 5000 with
+        # approval" are two grants, and which one applies depends on the amount.
+        tolerating = [
+            rule
+            for rule in allows
+            if self._tolerates(rule, reversible=reversible, amount=amount, affected=affected)
+        ]
+
+        if not tolerating:
+            # Something granted the action but nothing tolerates this size of it.
+            # Report the binding constraint rather than a bare denial.
+            blocked_by_reversibility = any(
+                not reversible and not rule.allow_irreversible for rule in allows
+            )
+            return ActionVerdict(
+                decision=Decision.DENY,
+                reason=(
+                    Reason.IRREVERSIBLE_BLOCKED
+                    if blocked_by_reversibility
+                    else Reason.IMPACT_LIMIT_EXCEEDED
+                ),
+                matched_rules=tuple(rule.id for rule in allows),
+            )
+
+        # Approval is needed only when every grant that covers this impact demands it.
+        # If one grant covers it freely, the agent has a path that needs no human.
+        requires_approval = all(rule.requires_approval for rule in tolerating)
+        return ActionVerdict(
+            decision=Decision.ALLOW,
+            reason=Reason.APPROVAL_REQUIRED if requires_approval else Reason.ALLOWED,
+            requires_approval=requires_approval,
+            matched_rules=tuple(rule.id for rule in tolerating),
+        )
+
+    @staticmethod
+    def _tolerates(rule: Rule, *, reversible: bool, amount: float, affected: int) -> bool:
+        """True when this grant covers an action of this size and reversibility."""
+        if rule.max_amount is not None and amount > rule.max_amount:
+            return False
+        if rule.max_affected is not None and affected > rule.max_affected:
+            return False
+        if not reversible and not rule.allow_irreversible:
+            return False
+        return True
+
+    @staticmethod
+    def _matches_identity(match: RuleMatch, principal: Principal, purpose: str) -> bool:
+        """Identity and purpose half of rule matching, shared by both evaluators."""
+        if match.principals and principal.id not in match.principals:
+            return False
+        if match.groups and not any(group in set(principal.groups) for group in match.groups):
+            return False
+        if match.tenants and principal.tenant not in match.tenants:
+            return False
+        if match.purposes and purpose not in match.purposes:
+            return False
+        return True
 
     @staticmethod
     def _matches(

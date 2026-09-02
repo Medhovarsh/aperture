@@ -36,6 +36,11 @@ CONFORMANCE: dict[tuple[str, str], set[str]] = {
     # Security audit sees everything, but only under the audit purpose.
     ("u_sam", "security_audit"): {"hr_handbook", "eng_runbooks", "support_kb", "people_db"},
     ("u_sam", "customer_support"): {"support_kb"},
+    # Platform lead: internal material only. Holding action authority over the
+    # purge action grants no extra read access.
+    ("u_ops", "engineering_oncall"): {"eng_runbooks"},
+    ("u_ops", "customer_support"): {"support_kb"},
+    ("u_ops", "data_retention"): set(),
     # Cross-tenant partner sees nothing of Acme's.
     ("u_partner", "customer_support"): set(),
     ("u_partner", "hr_support"): set(),

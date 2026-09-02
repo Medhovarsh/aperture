@@ -151,3 +151,114 @@ def test_stdio_loop_reads_and_writes_newline_delimited_json(plane: ContextPlane)
 
     lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert [message["id"] for message in lines] == [1, 2]
+
+
+# --------------------------------------------------------------------------- #
+# action tools
+# --------------------------------------------------------------------------- #
+
+
+def make_action_server(plane: ContextPlane) -> ApertureMCPServer:
+    return ApertureMCPServer(
+        plane,
+        principal_id="svc_support_agent",
+        default_purpose="customer_support",
+        gateway=plane.workspace.gateway(),
+    )
+
+
+def test_action_tools_are_hidden_in_a_read_only_workspace(plane: ContextPlane) -> None:
+    """An agent should not be shown verbs this deployment never grants."""
+    tools = request(make_server(plane), "tools/list")["result"]["tools"]
+    assert not any(tool["name"].startswith("action_") for tool in tools)
+
+
+def test_action_tools_appear_when_actions_are_registered(plane: ContextPlane) -> None:
+    tools = request(make_action_server(plane), "tools/list")["result"]["tools"]
+    names = {tool["name"] for tool in tools}
+    assert {"action_list", "action_propose", "action_execute", "action_status"} <= names
+
+
+def test_propose_returns_the_blast_radius_and_a_next_step(plane: ContextPlane) -> None:
+    payload = tool_payload(
+        request(
+            make_action_server(plane),
+            "tools/call",
+            {
+                "name": "action_propose",
+                "arguments": {
+                    "action_id": "support.refund",
+                    "arguments": {"customer_id": "cus-5510", "amount": 40},
+                },
+            },
+        )
+    )
+    assert payload["state"] == "ready"
+    assert payload["blast_radius"]["amount"] == 40
+    assert payload["blast_radius"]["reversible"] is True
+    assert "action_execute" in payload["next_step"]
+
+
+def test_proposal_needing_approval_tells_the_model_not_to_retry(plane: ContextPlane) -> None:
+    payload = tool_payload(
+        request(
+            make_action_server(plane),
+            "tools/call",
+            {
+                "name": "action_propose",
+                "arguments": {
+                    "action_id": "support.message_customer",
+                    "arguments": {"to": "a@b.example", "subject": "hi", "body": "hello"},
+                },
+            },
+        )
+    )
+    assert payload["state"] == "pending_approval"
+    assert payload["blast_radius"]["reversible"] is False
+    assert "do not retry" in payload["next_step"]
+
+
+def test_refusals_come_back_as_data_with_a_reason(plane: ContextPlane) -> None:
+    """A refusal is an outcome the model must relay, not a protocol error."""
+    payload = tool_payload(
+        request(
+            make_action_server(plane),
+            "tools/call",
+            {
+                "name": "action_propose",
+                "arguments": {
+                    "action_id": "support.refund",
+                    "arguments": {"customer_id": "cus-4471", "amount": 9000},
+                },
+            },
+        )
+    )
+    assert payload["refused"] is True
+    assert payload["reason"] == "impact_limit_exceeded"
+    assert "did not happen" in payload["disclosure_required"]
+
+
+def test_execute_reports_whether_the_result_can_be_undone(plane: ContextPlane) -> None:
+    server = make_action_server(plane)
+    proposal = tool_payload(
+        request(
+            server,
+            "tools/call",
+            {
+                "name": "action_propose",
+                "arguments": {
+                    "action_id": "support.close_ticket",
+                    "arguments": {"ticket_id": "tkt-1181"},
+                },
+            },
+        )
+    )
+    executed = tool_payload(
+        request(
+            server,
+            "tools/call",
+            {"name": "action_execute", "arguments": {"proposal_id": proposal["proposal_id"]}},
+        )
+    )
+    assert executed["executed"] is True
+    assert executed["reversible"] is True

@@ -8,9 +8,11 @@
 
 **A governed context plane for AI agents.**
 
-Agents read enterprise data through one chokepoint that knows four things at once:
-what the data *means*, who is *permitted* to see it, how *fresh* it is, and how to
-*explain a refusal*.
+Agents reach enterprise data and enterprise systems through one chokepoint. For
+**reads** it knows what the data *means*, who is *permitted* to see it, how *fresh*
+it is, and how to *explain a refusal*. For **actions** it measures the blast radius
+before anything happens, escalates to a human when policy says so, and records how
+to undo what it did.
 
 Runs as an MCP server. Zero paid dependencies, no model API key, no vector database,
 no cloud account. It installs inside a locked-down network.
@@ -85,7 +87,7 @@ routed to: hr_handbook
     Birthing parents receive 18 weeks of fully paid leave...
 
 Withheld:
-    2 x purpose_not_permitted - the declared purpose is not permitted for this source  [eng_runbooks, support_kb]
+    2 x purpose_not_permitted - the declared purpose is not permitted here  [eng_runbooks, support_kb]
 ```
 
 ```bash
@@ -96,7 +98,7 @@ aperture query -w workspace -p u_kim --purpose customer_support "how much parent
 routed to: support_kb
 
 Withheld:
-    3 x purpose_not_permitted - the declared purpose is not permitted for this source  [eng_runbooks, hr_handbook, people_db]
+    3 x purpose_not_permitted - the declared purpose is not permitted here  [eng_runbooks, hr_handbook, people_db]
 ```
 
 The support agent does not silently get a thin answer. It gets told what it could not see.
@@ -160,6 +162,105 @@ Tools exposed: `context_search`, `context_fetch`, `catalog_list_sources`, `acces
 
 ---
 
+## Actions: governing what an agent *does*
+
+The same chokepoint, extended past reads. Every agent action is proposed, priced,
+and only then executed.
+
+```
+propose -> measure blast radius -> policy -> [human approval] -> execute -> undo
+```
+
+```bash
+aperture actions -w workspace list -p svc_support_agent --purpose customer_support
+```
+
+```
+support.refund             [financial] reversible
+                           Refund a customer, in USD, against their account.
+support.close_ticket       [write] reversible
+                           Mark a support ticket resolved.
+support.message_customer   [external] IRREVERSIBLE, needs approval
+                           Send a message to an address outside the company.
+```
+
+### Blast radius is measured, not asserted
+
+```bash
+aperture actions -w workspace propose ops.purge_region -p u_ops --purpose data_retention --arg region=legacy
+```
+
+```
+REFUSED: impact_limit_exceeded
+  estimated impact exceeds the limit set by policy
+  Permanently delete every customer account in region 'legacy' | 7 record(s) affected | 10,320.00 USD | IRREVERSIBLE
+```
+
+One short argument, seven deleted accounts. The gap between those two facts is what a
+reviewer needs to see, and it comes from a dry run against real state - never from the
+agent's own description of what it is about to do.
+
+### Tiered approval
+
+Grants are alternatives, so tiers are expressible. Support refunds up to 100 USD freely;
+up to 5000 with a human; nothing above that:
+
+```yaml
+- id: support-small-refunds
+  effect: allow
+  when: {groups: [support], purposes: [customer_support], actions: [support.refund]}
+  max_amount: 100
+
+- id: support-large-refunds
+  effect: allow
+  when: {groups: [support], purposes: [customer_support], actions: [support.refund]}
+  max_amount: 5000
+  requires_approval: true
+```
+
+```bash
+aperture actions -w workspace propose support.refund -p svc_support_agent \
+  --purpose customer_support --arg customer_id=cus-4471 --arg amount=3000
+```
+
+```
+proposal prp_087ce0d889ba4838   [pending_approval]
+  blast:     Refund 3,000.00 USD to Rivera Logistics | 1 record(s) affected | reversible
+
+  A human must approve this before it can run:
+    aperture actions approve prp_087ce0d889ba4838 --as <approver-id>
+```
+
+```bash
+aperture actions -w workspace approve prp_087ce0d889ba4838 --as u_kim --note "verified duplicate charge"
+aperture actions -w workspace execute prp_087ce0d889ba4838 -p svc_support_agent
+aperture actions -w workspace rollback exe_a2146dd541694b6b -p u_kim
+```
+
+### The four properties that make this a control
+
+**Read access never becomes action authority.** A policy rule that names actions governs
+actions only; a rule that does not is invisible to action evaluation. No amount of read
+permission adds up to permission to act.
+
+**Approval is not a capability.** It is bound to one proposal, one argument hash, and one
+proposer, and it expires. Policy is re-evaluated at execution time, so a permission
+revoked between approval and execution stops the action. Approving 3,000 USD and then
+executing 90,000 fails with `arguments_changed`.
+
+**Agents never get approve or deny tools.** The MCP surface exposes `action_propose`,
+`action_execute`, and `action_status` - never approval. An agent that could approve its
+own proposal would make the step decorative. Humans decide out of band. The gateway also
+refuses self-approval outright, so a compromised service account holding two identities
+gains nothing.
+
+**Reversibility cannot be faked.** The catalog declares whether an action can be undone,
+and that claim is verified against the executor at load time. An action that promised an
+undo it could not deliver would be the most dangerous entry a catalog could contain, so
+the workspace refuses to load.
+
+---
+
 ## Try it in a browser
 
 A hosted playground ships in the repo: pick an identity, pick a purpose, ask a question,
@@ -214,6 +315,30 @@ agent (MCP client)
    |
    v
 records + provenance + withheld_summary + trace_id
+```
+
+Actions run the same shape, with a measurement step and a human in the middle:
+
+```
+agent (MCP client)
+   |
+   v  action_propose(action_id, arguments, purpose)
+[ action catalog ]  unregistered action = cannot be proposed
+   |
+   v
+[ executor.estimate ] dry run against real state -> blast radius
+   |
+   v
+[ policy ]          action rules only; grants are alternatives    fail closed
+   |
+   v
+[ approval ]        human decides out of band; bound to arguments; expires
+   |
+   v
+[ executor.execute ] -> result + compensation record
+   |
+   v
+[ lineage ]         same hash chain as reads
 ```
 
 ### Configuration
@@ -306,9 +431,12 @@ Enforced today:
 - **SQL identifiers come from the catalog** and are validated against the live schema.
 - **Record ids are not capabilities.** Permissions are re-evaluated on every fetch.
 - **Tenant isolation** is the first gate and is unconditional.
+- **Action authority is separate from read authority**, and impact limits are
+  evaluated against a measured blast radius rather than the agent's claim.
 
 The red-team suite (`tests/test_redteam.py`) probes each of these, including a poisoned
-document that instructs the system to override policy. It is retrieved as ordinary text
+document that instructs the system to override policy, an agent trying to approve its
+own action, and an approved proposal executed with swapped arguments. It is retrieved as ordinary text
 and changes nothing, because authorization is computed from the principal and the policy
 and nothing an attacker can write into an index participates in that decision.
 
@@ -317,7 +445,12 @@ and nothing an attacker can write into an index participates in that decision.
 - **The lineage log is tamper-evident, not tamper-proof.** Someone with write access can
   rewrite the whole file consistently. Detecting that needs the head hash anchored
   somewhere they do not control. Not built.
-- **Reads only.** Tool-call and write governance are v2.
+- **Single node.** Proposals and executions live in a JSON file with atomic writes.
+  That is enough for one process; a multi-node deployment needs a real store and
+  locking, which is not built.
+- **Executors are demo implementations.** They operate on a local SQLite database.
+  Pointing them at Stripe or Zendesk is a rewrite of one file, but it has not been
+  done here.
 - **Identity is a static file.** The registry sits behind an interface so an IdP can
   back it later; no IdP integration ships today.
 - **Retrieval is lexical BM25.** Deliberate — it makes the plane installable with no
@@ -333,7 +466,7 @@ pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-104 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
+151 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
 
 - **`tests/test_conformance.py`** — a policy conformance matrix asserting, for every
   (principal, purpose) pair, exactly which sources are readable. Read it as the

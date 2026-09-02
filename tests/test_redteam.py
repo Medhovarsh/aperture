@@ -221,3 +221,122 @@ def test_partner_in_another_tenant_reaches_nothing(plane: ContextPlane) -> None:
     for purpose in ("customer_support", "hr_support", "security_audit", "engineering_oncall"):
         response = plane.search("u_partner", SearchRequest(question="acme policies", purpose=purpose))
         assert response.records == [], f"partner saw records under purpose {purpose}"
+
+
+# --------------------------------------------------------------------------- #
+# 6. Action governance (v2)
+# --------------------------------------------------------------------------- #
+
+
+def test_read_access_never_becomes_action_authority(plane: ContextPlane) -> None:
+    """The HR principal can read plenty. That must buy no power to act."""
+    gateway = plane.workspace.gateway()
+    refusal = gateway.propose(
+        "u_dana", "customer_support", "support.refund",
+        {"customer_id": "cus-4471", "amount": 10.0},
+    )
+    assert refusal.reason is Reason.ACTION_NOT_PERMITTED
+
+
+def test_an_agent_cannot_approve_its_own_proposal(plane: ContextPlane) -> None:
+    gateway = plane.workspace.gateway()
+    proposal = gateway.propose(
+        "svc_support_agent", "customer_support", "support.refund",
+        {"customer_id": "cus-4471", "amount": 3000.0},
+    )
+    refusal = gateway.decide(proposal.id, "svc_support_agent", True)
+    assert refusal.reason is Reason.SELF_APPROVAL_FORBIDDEN
+
+
+def test_approval_is_bound_to_the_arguments_that_were_reviewed(plane: ContextPlane) -> None:
+    """Approve a 3000 refund, execute a 90000 one: the classic bait and switch."""
+    gateway = plane.workspace.gateway()
+    proposal = gateway.propose(
+        "svc_support_agent", "customer_support", "support.refund",
+        {"customer_id": "cus-4471", "amount": 3000.0},
+    )
+    gateway.decide(proposal.id, "u_kim", True)
+    refusal = gateway.execute(
+        proposal.id, "svc_support_agent",
+        arguments={"customer_id": "cus-4471", "amount": 90000.0},
+    )
+    assert refusal.reason is Reason.ARGUMENTS_CHANGED
+
+
+def test_another_identity_cannot_execute_someone_elses_approval(plane: ContextPlane) -> None:
+    gateway = plane.workspace.gateway()
+    proposal = gateway.propose(
+        "svc_support_agent", "customer_support", "support.refund",
+        {"customer_id": "cus-5510", "amount": 20.0},
+    )
+    refusal = gateway.execute(proposal.id, "u_kim")
+    assert refusal.reason is Reason.ACTION_NOT_PERMITTED
+
+
+def test_permission_revoked_after_approval_stops_execution(workspace_root: Path) -> None:
+    """Approval is not a capability. The check at execution time is the one that counts."""
+    from aperture.workspace import Workspace as _Workspace
+
+    gateway = _Workspace.load(workspace_root).gateway()
+    proposal = gateway.propose(
+        "svc_support_agent", "customer_support", "support.refund",
+        {"customer_id": "cus-4471", "amount": 3000.0},
+    )
+    gateway.decide(proposal.id, "u_kim", True)
+
+    # The grant is withdrawn between approval and execution.
+    policy_path = workspace_root / "policy.yaml"
+    policy_path.write_text(
+        policy_path.read_text(encoding="utf-8").replace(
+            "  - id: support-large-refunds\n    effect: allow",
+            "  - id: support-large-refunds\n    effect: deny",
+        ),
+        encoding="utf-8",
+    )
+
+    refusal = _Workspace.load(workspace_root).gateway().execute(
+        proposal.id, "svc_support_agent"
+    )
+    assert not isinstance(refusal, ResultRecord)
+    assert refusal.reason in {Reason.EXPLICIT_DENY, Reason.ACTION_NOT_PERMITTED}
+
+
+def test_blast_radius_comes_from_state_not_from_the_agent(plane: ContextPlane) -> None:
+    """The agent cannot shrink its own blast radius by describing it differently."""
+    gateway = plane.workspace.gateway()
+    refusal = gateway.propose(
+        "u_ops", "data_retention", "ops.purge_region",
+        {"region": "legacy", "affected": 1},
+    )
+    # 'affected' is not a declared parameter, so the attempt is rejected outright.
+    assert refusal.reason is Reason.INVALID_ARGUMENTS
+
+    honest = gateway.propose("u_ops", "data_retention", "ops.purge_region", {"region": "legacy"})
+    assert honest.reason is Reason.IMPACT_LIMIT_EXCEEDED
+
+
+def test_partner_cannot_take_any_action(plane: ContextPlane) -> None:
+    gateway = plane.workspace.gateway()
+    for action_id, arguments in [
+        ("support.refund", {"customer_id": "cus-4471", "amount": 5.0}),
+        ("support.close_ticket", {"ticket_id": "tkt-1180"}),
+    ]:
+        refusal = gateway.propose("u_partner", "customer_support", action_id, arguments)
+        assert not isinstance(refusal, ResultRecord)
+        assert refusal.reason in {Reason.EXPLICIT_DENY, Reason.ACTION_NOT_PERMITTED}
+
+
+def test_agents_are_never_given_approve_or_deny_tools(plane: ContextPlane) -> None:
+    """Approval must live outside anything a prompt can reach."""
+    server = ApertureMCPServer(
+        plane,
+        principal_id="svc_support_agent",
+        default_purpose="customer_support",
+        gateway=plane.workspace.gateway(),
+    )
+    response = server.handle(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    )
+    names = {tool["name"] for tool in response["result"]["tools"]}
+    assert "action_propose" in names
+    assert not {"action_approve", "action_deny", "action_decide"} & names

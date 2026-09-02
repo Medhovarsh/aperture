@@ -87,6 +87,70 @@ sources:
       updated_column: updated_at
 """
 
+ACTIONS = """\
+# Registered actions. An action absent from this file cannot be proposed.
+# 'reversible' is verified against the executor at load time: an action cannot
+# claim to be undoable unless its executor implements a compensating operation.
+actions:
+  - id: support.refund
+    title: Issue a refund
+    description: Refund a customer, in USD, against their account.
+    executor: refund
+    owner: support@acme.example
+    effect_class: financial
+    reversible: true
+    allowed_purposes: [customer_support]
+    parameters:
+      customer_id: {type: string, description: Customer to refund}
+      amount: {type: number, description: Amount in USD}
+    config:
+      database: data/ops.db
+      approver_groups: [support-leads]
+
+  - id: support.close_ticket
+    title: Close a support ticket
+    description: Mark a support ticket resolved.
+    executor: ticket
+    owner: support@acme.example
+    effect_class: write
+    reversible: true
+    allowed_purposes: [customer_support]
+    parameters:
+      ticket_id: {type: string, description: Ticket to close}
+    config:
+      database: data/ops.db
+
+  - id: support.message_customer
+    title: Email a customer
+    description: Send a message to an address outside the company.
+    executor: message
+    owner: support@acme.example
+    effect_class: external
+    reversible: false
+    allowed_purposes: [customer_support]
+    parameters:
+      to: {type: string, description: Recipient address}
+      subject: {type: string, description: Subject line}
+      body: {type: string, description: Message body}
+    config:
+      database: data/ops.db
+      approver_groups: [support-leads]
+
+  - id: ops.purge_region
+    title: Purge a region
+    description: Permanently delete every customer account in a region.
+    executor: account_purge
+    owner: platform@acme.example
+    effect_class: destructive
+    reversible: false
+    allowed_purposes: [data_retention]
+    parameters:
+      region: {type: string, description: Region code to purge}
+    config:
+      database: data/ops.db
+      approver_groups: [security-audit]
+"""
+
 POLICY = """\
 version: 1
 
@@ -96,6 +160,7 @@ purposes:
   - engineering_oncall
   - customer_support
   - security_audit
+  - data_retention
 
 defaults:
   # "tag" returns stale records flagged; "drop" withholds them with reason=stale.
@@ -143,6 +208,63 @@ rules:
       groups: [security-audit]
       purposes: [security_audit]
 
+  # --- actions (v2) --------------------------------------------------------
+  # These rules name actions, so they govern actions only. No amount of read
+  # access can add up to permission to act.
+
+  - id: support-small-refunds
+    effect: allow
+    description: Support may refund up to 100 USD without asking anyone.
+    when:
+      groups: [support]
+      purposes: [customer_support]
+      actions: [support.refund]
+    max_amount: 100
+
+  - id: support-large-refunds
+    effect: allow
+    description: Larger refunds are allowed up to 5000 USD, with a human approval.
+    when:
+      groups: [support]
+      purposes: [customer_support]
+      actions: [support.refund]
+    max_amount: 5000
+    requires_approval: true
+
+  - id: support-close-tickets
+    effect: allow
+    description: Closing a ticket is reversible and needs no approval.
+    when:
+      groups: [support]
+      purposes: [customer_support]
+      actions: [support.close_ticket]
+
+  - id: support-external-messages
+    effect: allow
+    description: Anything that leaves the company needs a human first.
+    when:
+      groups: [support]
+      purposes: [customer_support]
+      actions: [support.message_customer]
+    requires_approval: true
+
+  - id: platform-region-purge
+    effect: allow
+    description: Platform may purge a region, with approval, up to 5 accounts.
+    when:
+      groups: [platform]
+      purposes: [data_retention]
+      actions: [ops.purge_region]
+    max_affected: 5
+    requires_approval: true
+
+  - id: deny-partners-actions
+    effect: deny
+    description: Partners may not take any action in this tenant.
+    when:
+      groups: [partners]
+      actions: ["*"]
+
   # --- hard denials --------------------------------------------------------
   - id: deny-partners-confidential
     effect: deny
@@ -169,13 +291,19 @@ principals:
   - id: u_kim
     display_name: Kim Alvarez (Support Lead)
     tenant: acme
-    groups: [employees, support]
+    groups: [employees, support, support-leads]
     clearance: internal
 
   - id: svc_support_agent
     display_name: Support Copilot (service account)
     tenant: acme
     groups: [employees, support]
+    clearance: internal
+
+  - id: u_ops
+    display_name: Ana Duarte (Platform Lead)
+    tenant: acme
+    groups: [employees, platform, platform-leads]
     clearance: internal
 
   - id: u_sam
@@ -233,6 +361,7 @@ def build_demo_workspace(root: Path) -> Path:
     (root / "catalog.yaml").write_text(CATALOG, encoding="utf-8")
     (root / "policy.yaml").write_text(POLICY, encoding="utf-8")
     (root / "principals.yaml").write_text(PRINCIPALS, encoding="utf-8")
+    (root / "actions.yaml").write_text(ACTIONS, encoding="utf-8")
 
     now = datetime.now(timezone.utc)
     recent = now - timedelta(days=30)
@@ -429,4 +558,73 @@ def build_demo_workspace(root: Path) -> Path:
     connection.commit()
     connection.close()
 
+    _build_operations_db(root / "data" / "ops.db")
+
     return root
+
+
+def _build_operations_db(db_path: Path) -> None:
+    """Create the systems actions operate on: customers, tickets, refunds, messages."""
+    if db_path.exists():
+        db_path.unlink()
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE customers (
+            customer_id TEXT PRIMARY KEY,
+            name TEXT,
+            region TEXT,
+            lifetime_value REAL
+        );
+        CREATE TABLE tickets (
+            ticket_id TEXT PRIMARY KEY,
+            customer_id TEXT,
+            subject TEXT,
+            status TEXT
+        );
+        CREATE TABLE refunds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id TEXT,
+            amount REAL,
+            status TEXT,
+            created_at TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient TEXT,
+            subject TEXT,
+            body TEXT,
+            sent_at TEXT
+        );
+        """
+    )
+    connection.executemany(
+        "INSERT INTO customers VALUES (?,?,?,?)",
+        [
+            ("cus-4471", "Rivera Logistics", "us-east", 42000.0),
+            ("cus-5510", "Northwind Books", "us-east", 8800.0),
+            ("cus-6602", "Kestrel Design", "eu-west", 15600.0),
+            ("cus-7713", "Marabou Foods", "eu-west", 3100.0),
+            ("cus-8890", "Lumen Analytics", "eu-west", 26400.0),
+            ("cus-9021", "Tessellate Labs", "apac", 5200.0),
+            # A region large enough that purging it breaches the policy limit,
+            # so the demo can show impact_limit_exceeded rather than only describe it.
+            ("cus-1001", "Halcyon Print", "legacy", 900.0),
+            ("cus-1002", "Orbit Stationers", "legacy", 1200.0),
+            ("cus-1003", "Pallas Textiles", "legacy", 640.0),
+            ("cus-1004", "Vesper Cycles", "legacy", 2300.0),
+            ("cus-1005", "Wren Ceramics", "legacy", 480.0),
+            ("cus-1006", "Yarrow Optics", "legacy", 1750.0),
+            ("cus-1007", "Zephyr Tooling", "legacy", 3050.0),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO tickets VALUES (?,?,?,?)",
+        [
+            ("tkt-1180", "cus-4471", "Duplicate charge on August invoice", "open"),
+            ("tkt-1181", "cus-5510", "Cannot reset password", "open"),
+            ("tkt-1182", "cus-6602", "Requesting plan downgrade", "pending"),
+        ],
+    )
+    connection.commit()
+    connection.close()

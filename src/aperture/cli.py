@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .actions.types import ActionRefusal, ExecutionRecord, Proposal
 from .demo import build_demo_workspace
 from .plane import ContextPlane
 from .types import SearchRequest
@@ -64,6 +65,7 @@ def cmd_lint(args: argparse.Namespace) -> int:
     print("Workspace is valid.")
     print(f"  sources:    {len(workspace.catalog)}  ({', '.join(workspace.catalog.ids())})")
     print(f"  principals: {len(workspace.principals)}  ({', '.join(workspace.principals.ids())})")
+    print(f"  actions:    {len(workspace.actions)}  ({', '.join(workspace.actions.ids()) or 'read-only workspace'})")
     print(f"  purposes:   {', '.join(workspace.policy.purposes) or '(any)'}")
     print(f"  rules:      {len(workspace.policy.rules)}")
     print(f"  stale action: {workspace.policy.defaults.stale_action}")
@@ -172,6 +174,143 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_arguments(spec_parameters: dict, pairs: list[str]) -> dict[str, object]:
+    """Turn repeated --arg key=value options into typed arguments.
+
+    Types come from the action's declared parameters, so "amount=50" becomes a
+    number for an action that declares one and stays a string for one that does not.
+    """
+    arguments: dict[str, object] = {}
+    for pair in pairs or []:
+        if "=" not in pair:
+            raise ValueError(f"--arg expects key=value, got {pair!r}")
+        key, _, raw = pair.partition("=")
+        parameter = spec_parameters.get(key)
+        declared = parameter.type if parameter else "string"
+        if declared == "number":
+            arguments[key] = float(raw)
+        elif declared == "integer":
+            arguments[key] = int(raw)
+        elif declared == "boolean":
+            arguments[key] = raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            arguments[key] = raw
+    return arguments
+
+
+def _report_refusal(refusal: ActionRefusal) -> int:
+    print(f"REFUSED: {refusal.reason}", file=sys.stderr)
+    print(f"  {refusal.explanation}", file=sys.stderr)
+    if refusal.detail:
+        print(f"  {refusal.detail}", file=sys.stderr)
+    return 1
+
+
+def _print_proposal(proposal: Proposal) -> None:
+    print(f"proposal {proposal.id}   [{proposal.state}]")
+    print(f"  action:    {proposal.action_id}")
+    print(f"  proposer:  {proposal.principal_id}   purpose: {proposal.purpose}")
+    print(f"  arguments: {proposal.arguments}")
+    print(f"  blast:     {proposal.blast.headline()}")
+    print(f"  rules:     {', '.join(proposal.matched_rules) or '(none)'}")
+    if proposal.approval:
+        verdict = "approved" if proposal.approval.approved else "denied"
+        print(f"  {verdict} by {proposal.approval.decided_by}: {proposal.approval.note}")
+    if proposal.state == "pending_approval":
+        print("\n  A human must approve this before it can run:")
+        print(f"    aperture actions approve {proposal.id} --as <approver-id>")
+
+
+def cmd_actions(args: argparse.Namespace) -> int:
+    """Propose, approve, execute, and roll back governed actions."""
+    workspace = Workspace.load(args.workspace)
+    gateway = workspace.gateway()
+    action = args.action_command
+
+    if action == "list":
+        visible = gateway.list_actions(args.principal, args.purpose)
+        if args.json:
+            _print_json(visible)
+            return 0
+        if not visible:
+            print(f"{args.principal} may take no actions under purpose '{args.purpose}'.")
+            return 0
+        print(f"Actions available to {args.principal} under '{args.purpose}':")
+        for entry in visible:
+            flags = []
+            flags.append("reversible" if entry["reversible"] else "IRREVERSIBLE")
+            if entry["requires_approval"]:
+                flags.append("needs approval")
+            print(f"  {entry['id']:<26} [{entry['effect_class']}] {', '.join(flags)}")
+            print(f"  {'':<26} {entry['description']}")
+        return 0
+
+    if action == "propose":
+        spec = workspace.actions.get(args.action)
+        parameters = spec.parameters if spec else {}
+        result = gateway.propose(
+            args.principal, args.purpose, args.action, _parse_arguments(parameters, args.arg)
+        )
+        if isinstance(result, ActionRefusal):
+            return _report_refusal(result)
+        _print_proposal(result)
+        return 0
+
+    if action == "pending":
+        proposals = workspace.action_store.list_proposals(state="pending_approval")
+        if not proposals:
+            print("No proposals are waiting for approval.")
+            return 0
+        print(f"{len(proposals)} proposal(s) awaiting approval:\n")
+        for proposal in proposals:
+            _print_proposal(proposal)
+            print()
+        return 0
+
+    if action in {"approve", "deny"}:
+        result = gateway.decide(
+            args.proposal_id, args.approver, approved=(action == "approve"), note=args.note
+        )
+        if isinstance(result, ActionRefusal):
+            return _report_refusal(result)
+        _print_proposal(result)
+        return 0
+
+    if action == "execute":
+        result = gateway.execute(args.proposal_id, args.principal)
+        if isinstance(result, ActionRefusal):
+            return _report_refusal(result)
+        print(f"executed {result.id}")
+        print(f"  action: {result.action_id}")
+        print(f"  result: {result.result}")
+        if result.reversible:
+            print(f"  undo:   aperture actions rollback {result.id} -p <approver-id>")
+        else:
+            print("  undo:   not possible - this action is irreversible")
+        return 0
+
+    if action == "rollback":
+        result = gateway.rollback(args.execution_id, args.principal)
+        if isinstance(result, ActionRefusal):
+            return _report_refusal(result)
+        print(f"rolled back {result.id}")
+        print(f"  result: {result.rollback_result}")
+        return 0
+
+    if action == "history":
+        records: list[ExecutionRecord] = workspace.action_store.list_executions()
+        if not records:
+            print("No actions have been executed.")
+            return 0
+        for record in records:
+            state = "rolled back" if record.rolled_back_at else "executed"
+            print(f"{record.executed_at}  {record.id}  {record.action_id:<24} "
+                  f"{record.principal_id:<20} {state}")
+        return 0
+
+    raise ValueError(f"unknown action command: {action}")
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the MCP server over stdio."""
     from .mcp_server import serve_stdio
@@ -239,6 +378,47 @@ def build_parser() -> argparse.ArgumentParser:
     lineage.add_argument("action", choices=["tail", "verify"], default="tail", nargs="?")
     lineage.add_argument("--limit", type=int, default=20)
     lineage.set_defaults(func=cmd_lineage)
+
+    actions = subparsers.add_parser("actions", help="govern what agents may do")
+    add_workspace(actions)
+    action_subparsers = actions.add_subparsers(dest="action_command", required=True)
+    actions.set_defaults(func=cmd_actions)
+
+    act_list = action_subparsers.add_parser("list", help="actions a principal may take")
+    act_list.add_argument("-p", "--principal", required=True)
+    act_list.add_argument("--purpose", required=True)
+    act_list.add_argument("--json", action="store_true")
+
+    act_propose = action_subparsers.add_parser("propose", help="price and register an action")
+    act_propose.add_argument("action", help="action id, e.g. support.refund")
+    act_propose.add_argument("-p", "--principal", required=True)
+    act_propose.add_argument("--purpose", required=True)
+    act_propose.add_argument(
+        "--arg", action="append", default=[], metavar="KEY=VALUE",
+        help="action argument; repeat for each one",
+    )
+
+    action_subparsers.add_parser("pending", help="proposals awaiting human approval")
+
+    act_approve = action_subparsers.add_parser("approve", help="approve a pending proposal")
+    act_approve.add_argument("proposal_id")
+    act_approve.add_argument("--as", dest="approver", required=True, help="approving identity")
+    act_approve.add_argument("--note", default="")
+
+    act_deny = action_subparsers.add_parser("deny", help="reject a pending proposal")
+    act_deny.add_argument("proposal_id")
+    act_deny.add_argument("--as", dest="approver", required=True)
+    act_deny.add_argument("--note", default="")
+
+    act_execute = action_subparsers.add_parser("execute", help="run a cleared proposal")
+    act_execute.add_argument("proposal_id")
+    act_execute.add_argument("-p", "--principal", required=True)
+
+    act_rollback = action_subparsers.add_parser("rollback", help="undo an execution")
+    act_rollback.add_argument("execution_id")
+    act_rollback.add_argument("-p", "--principal", required=True)
+
+    action_subparsers.add_parser("history", help="everything that has been executed")
 
     serve = subparsers.add_parser("serve", help="run the MCP server over stdio")
     add_workspace(serve)

@@ -49,3 +49,46 @@ $APERTURE lineage -w "$WORKSPACE" tail --limit 6
 
 banner "Chain integrity"
 $APERTURE lineage -w "$WORKSPACE" verify
+
+banner "7. ACTIONS: what may this agent actually do?"
+$APERTURE actions -w "$WORKSPACE" list -p svc_support_agent --purpose customer_support
+
+banner "8. Small refund: under the free limit, no human needed"
+$APERTURE actions -w "$WORKSPACE" propose support.refund \
+    -p svc_support_agent --purpose customer_support \
+    --arg customer_id=cus-5510 --arg amount=50
+
+banner "9. Large refund: blast radius priced, human required"
+$APERTURE actions -w "$WORKSPACE" propose support.refund \
+    -p svc_support_agent --purpose customer_support \
+    --arg customer_id=cus-4471 --arg amount=3000
+
+PROPOSAL=$($APERTURE actions -w "$WORKSPACE" pending | grep -o 'prp_[a-f0-9]*' | head -1)
+
+banner "10. The proposer tries to approve itself"
+$APERTURE actions -w "$WORKSPACE" approve "$PROPOSAL" --as svc_support_agent || true
+
+banner "11. A support lead approves, then the agent executes"
+$APERTURE actions -w "$WORKSPACE" approve "$PROPOSAL" --as u_kim --note "verified duplicate charge"
+$APERTURE actions -w "$WORKSPACE" execute "$PROPOSAL" -p svc_support_agent
+
+banner "12. Undo it"
+EXECUTION=$($APERTURE actions -w "$WORKSPACE" history | grep -o 'exe_[a-f0-9]*' | head -1)
+$APERTURE actions -w "$WORKSPACE" rollback "$EXECUTION" -p u_kim
+
+banner "13. A refund beyond every grant"
+$APERTURE actions -w "$WORKSPACE" propose support.refund \
+    -p svc_support_agent --purpose customer_support \
+    --arg customer_id=cus-4471 --arg amount=9000 || true
+
+banner "14. One short argument, seven deleted accounts"
+$APERTURE actions -w "$WORKSPACE" propose ops.purge_region \
+    -p u_ops --purpose data_retention --arg region=legacy || true
+
+banner "15. Read access is not action authority"
+$APERTURE actions -w "$WORKSPACE" propose support.refund \
+    -p u_dana --purpose customer_support \
+    --arg customer_id=cus-4471 --arg amount=10 || true
+
+banner "Audit trail now covers reads and actions in one chain"
+$APERTURE lineage -w "$WORKSPACE" verify

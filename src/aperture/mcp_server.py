@@ -22,6 +22,8 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+from .actions.gateway import ActionGateway
+from .actions.types import ActionRefusal, Proposal
 from .plane import ContextPlane
 from .types import ResultRecord, SearchRequest, WithheldGroup
 from .workspace import Workspace
@@ -104,7 +106,115 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["trace_id"],
         },
     },
+    {
+        "name": "action_list",
+        "description": (
+            "List the actions this caller may take under a purpose, with whether each "
+            "one can be undone and whether it needs human approval. Check here before "
+            "promising a user that something can be done."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"purpose": {"type": "string"}},
+        },
+    },
+    {
+        "name": "action_propose",
+        "description": (
+            "Propose an action. This does NOT perform it. The gateway measures the "
+            "real blast radius, applies policy, and returns either a proposal you may "
+            "execute, a proposal awaiting human approval, or a refusal with a reason. "
+            "Always show the blast radius to the user before executing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action_id": {"type": "string", "description": "e.g. support.refund"},
+                "arguments": {"type": "object", "description": "Action arguments"},
+                "purpose": {"type": "string"},
+            },
+            "required": ["action_id", "arguments"],
+        },
+    },
+    {
+        "name": "action_execute",
+        "description": (
+            "Execute a proposal that is in the 'ready' state. Proposals awaiting "
+            "approval cannot be executed until a human approves them out of band; "
+            "poll action_status rather than retrying."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"proposal_id": {"type": "string"}},
+            "required": ["proposal_id"],
+        },
+    },
+    {
+        "name": "action_status",
+        "description": (
+            "Check a proposal: its state, blast radius, and any human decision. Use "
+            "this to tell the user whether their request is waiting on an approver."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"proposal_id": {"type": "string"}},
+            "required": ["proposal_id"],
+        },
+    },
 ]
+
+# Approve and deny are deliberately absent from the tool surface. An agent that could
+# approve its own proposal would make the approval step decorative, and an agent that
+# could approve another agent's would make it worse. Humans decide out of band, through
+# the CLI or a review UI.
+
+
+def _render_action_result(result: "Proposal | ActionRefusal") -> dict[str, Any]:
+    """Shape a proposal or refusal for the model, with the next step spelled out."""
+    if isinstance(result, ActionRefusal):
+        return {
+            "refused": True,
+            "reason": str(result.reason),
+            "explanation": result.explanation,
+            "detail": result.detail,
+            "disclosure_required": (
+                "This action was refused. Tell the user it did not happen and why."
+            ),
+        }
+
+    payload: dict[str, Any] = {
+        "proposal_id": result.id,
+        "state": str(result.state),
+        "action_id": result.action_id,
+        "arguments": result.arguments,
+        "blast_radius": {
+            "summary": result.blast.summary,
+            "headline": result.blast.headline(),
+            "affected": result.blast.affected,
+            "amount": result.blast.amount,
+            "currency": result.blast.currency,
+            "external_recipients": list(result.blast.external_recipients),
+            "reversible": result.blast.reversible,
+        },
+        "matched_rules": list(result.matched_rules),
+    }
+    if result.state == "pending_approval":
+        payload["next_step"] = (
+            "A human must approve this before it can run. Tell the user the action is "
+            "pending approval and show them the blast radius; do not retry execution."
+        )
+    elif result.state == "ready":
+        payload["next_step"] = (
+            "Show the blast radius to the user, then call action_execute with this "
+            "proposal_id if they confirm."
+        )
+    if result.approval:
+        payload["approval"] = {
+            "approved": result.approval.approved,
+            "decided_by": result.approval.decided_by,
+            "note": result.approval.note,
+        }
+    return payload
 
 
 def _render_records(records: list[ResultRecord]) -> list[dict[str, Any]]:
@@ -147,8 +257,10 @@ class ApertureMCPServer:
         principal_id: str,
         default_purpose: str | None = None,
         allow_principal_override: bool = False,
+        gateway: ActionGateway | None = None,
     ) -> None:
         self.plane = plane
+        self.gateway = gateway
         self.principal_id = principal_id
         self.default_purpose = default_purpose
         self.allow_principal_override = allow_principal_override
@@ -191,6 +303,12 @@ class ApertureMCPServer:
         }
 
     def _tools_list(self, _params: dict[str, Any]) -> dict[str, Any]:
+        """Advertise the read tools, plus action tools when actions are registered.
+
+        A read-only workspace should not show an agent verbs it can never use.
+        """
+        if self.gateway is None or not len(self.gateway.catalog):
+            return {"tools": [tool for tool in TOOLS if not tool["name"].startswith("action_")]}
         return {"tools": TOOLS}
 
     def _tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -266,6 +384,66 @@ class ApertureMCPServer:
                 raise ValueError(f"no audit record for trace {trace_id}")
             return {"audit_record": entry}
 
+        if name.startswith("action_"):
+            return self._dispatch_action(name, arguments, principal)
+
+        raise ValueError(f"unknown tool: {name}")
+
+    def _dispatch_action(
+        self, name: str, arguments: dict[str, Any], principal: str
+    ) -> dict[str, Any]:
+        """Handle the action tools.
+
+        Refusals come back as data with a reason code rather than as protocol errors,
+        because a refusal is a legitimate outcome the model must relay to the user.
+        """
+        if self.gateway is None:
+            raise ValueError("this workspace registers no actions")
+
+        if name == "action_list":
+            return {"actions": self.gateway.list_actions(principal, self._resolve_purpose(arguments))}
+
+        if name == "action_propose":
+            action_id = arguments.get("action_id")
+            if not action_id:
+                raise ValueError("action_id is required")
+            result = self.gateway.propose(
+                principal,
+                self._resolve_purpose(arguments),
+                str(action_id),
+                dict(arguments.get("arguments") or {}),
+            )
+            return _render_action_result(result)
+
+        if name == "action_execute":
+            proposal_id = arguments.get("proposal_id")
+            if not proposal_id:
+                raise ValueError("proposal_id is required")
+            result = self.gateway.execute(str(proposal_id), principal)
+            if isinstance(result, ActionRefusal):
+                return _render_action_result(result)
+            return {
+                "executed": True,
+                "execution_id": result.id,
+                "action_id": result.action_id,
+                "result": result.result,
+                "reversible": result.reversible,
+                "undo": (
+                    "A human can undo this through the Aperture CLI."
+                    if result.reversible
+                    else "This action cannot be undone."
+                ),
+            }
+
+        if name == "action_status":
+            proposal_id = arguments.get("proposal_id")
+            if not proposal_id:
+                raise ValueError("proposal_id is required")
+            proposal = self.gateway.store.get_proposal(str(proposal_id))
+            if proposal is None:
+                raise ValueError(f"no such proposal: {proposal_id}")
+            return _render_action_result(proposal)
+
         raise ValueError(f"unknown tool: {name}")
 
     # -- transport -------------------------------------------------------- #
@@ -323,8 +501,9 @@ def serve_stdio(
     Configuration errors surface before the first request: an invalid policy stops
     the server rather than starting one that cannot enforce it.
     """
-    plane = ContextPlane(Workspace.load(workspace_root))
-    if plane.workspace.principals.get(principal_id) is None:
+    workspace = Workspace.load(workspace_root)
+    plane = ContextPlane(workspace)
+    if workspace.principals.get(principal_id) is None:
         raise SystemExit(
             f"principal '{principal_id}' is not registered in this workspace"
         )
@@ -333,5 +512,6 @@ def serve_stdio(
         principal_id=principal_id,
         default_purpose=default_purpose,
         allow_principal_override=allow_principal_override,
+        gateway=workspace.gateway() if len(workspace.actions) else None,
     )
     server.run(sys.stdin, sys.stdout)

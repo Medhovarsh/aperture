@@ -22,6 +22,9 @@ from typing import Any
 
 import yaml
 
+from .actions.catalog import ActionCatalog
+from .actions.gateway import ActionGateway
+from .actions.store import ActionStore
 from .catalog import Catalog
 from .identity import PrincipalRegistry
 from .lineage import LineageLog
@@ -30,7 +33,9 @@ from .policy import Policy
 CATALOG_FILE = "catalog.yaml"
 POLICY_FILE = "policy.yaml"
 PRINCIPALS_FILE = "principals.yaml"
+ACTIONS_FILE = "actions.yaml"
 LINEAGE_FILE = "lineage/access.jsonl"
+STATE_DIR = "state"
 
 
 class WorkspaceError(RuntimeError):
@@ -58,11 +63,15 @@ class Workspace:
         catalog: Catalog,
         policy: Policy,
         principals: PrincipalRegistry,
+        actions: ActionCatalog | None = None,
     ) -> None:
         self.root = root
         self.catalog = catalog
         self.policy = policy
         self.principals = principals
+        # Absent actions.yaml means the workspace is read-only, which is a valid and
+        # deliberately common configuration.
+        self.actions = actions or ActionCatalog.empty()
 
     @classmethod
     def load(cls, root: Path) -> "Workspace":
@@ -74,12 +83,21 @@ class Workspace:
             catalog = Catalog.from_dict(_load_yaml(root / CATALOG_FILE))
             policy = Policy.from_dict(_load_yaml(root / POLICY_FILE))
             principals = PrincipalRegistry.from_dict(_load_yaml(root / PRINCIPALS_FILE))
+            actions_path = root / ACTIONS_FILE
+            actions = (
+                ActionCatalog.from_dict(_load_yaml(actions_path))
+                if actions_path.is_file()
+                else ActionCatalog.empty()
+            )
         except WorkspaceError:
             raise
         except Exception as exc:  # noqa: BLE001 - surface as a single startup error
             raise WorkspaceError(f"invalid workspace configuration: {exc}") from exc
 
-        workspace = cls(root=root, catalog=catalog, policy=policy, principals=principals)
+        workspace = cls(
+            root=root, catalog=catalog, policy=policy,
+            principals=principals, actions=actions,
+        )
         workspace.check_references()
         return workspace
 
@@ -90,6 +108,7 @@ class Workspace:
         and silently ignoring it is how permissions rot.
         """
         known = set(self.catalog.ids())
+        known_actions = set(self.actions.ids())
         for rule in self.policy.rules:
             unknown = [s for s in rule.when.sources if s not in known]
             if unknown:
@@ -97,8 +116,36 @@ class Workspace:
                     f"policy rule '{rule.id}' references unregistered source(s): "
                     f"{', '.join(sorted(unknown))}"
                 )
+            unknown_actions = [
+                a for a in rule.when.actions if a != "*" and a not in known_actions
+            ]
+            if unknown_actions:
+                raise WorkspaceError(
+                    f"policy rule '{rule.id}' references unregistered action(s): "
+                    f"{', '.join(sorted(unknown_actions))}"
+                )
 
     @property
     def lineage(self) -> LineageLog:
-        """The access lineage log for this workspace."""
+        """The access lineage log for this workspace.
+
+        Reads and actions share one chain, so an auditor reconstructing an incident
+        sees what the agent looked at and what it then did, in order.
+        """
         return LineageLog(self.root / LINEAGE_FILE)
+
+    @property
+    def action_store(self) -> ActionStore:
+        """Durable proposal and execution state."""
+        return ActionStore(self.root / STATE_DIR)
+
+    def gateway(self) -> ActionGateway:
+        """Build the action gateway for this workspace."""
+        return ActionGateway(
+            principals=self.principals,
+            policy=self.policy,
+            catalog=self.actions,
+            store=self.action_store,
+            lineage=self.lineage,
+            workspace_root=self.root,
+        )

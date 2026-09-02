@@ -88,6 +88,34 @@ jobs:
           assert data['withheld'], 'withheld records must be reported, not hidden'
           "
 
+      - name: Action governance must hold end to end
+        run: |
+          set -euo pipefail
+          AGENT="-p svc_support_agent --purpose customer_support"
+
+          # A refund beyond every grant is refused, and nothing is written.
+          if aperture actions -w ci_workspace propose support.refund $AGENT \
+              --arg customer_id=cus-4471 --arg amount=9000; then
+            echo "an over-limit refund was accepted" && exit 1
+          fi
+
+          # Read authority must not grant action authority.
+          if aperture actions -w ci_workspace propose support.refund \
+              -p u_dana --purpose customer_support \
+              --arg customer_id=cus-4471 --arg amount=10; then
+            echo "read access granted action authority" && exit 1
+          fi
+
+          # A large refund needs a human, and the proposer is not one.
+          aperture actions -w ci_workspace propose support.refund $AGENT \
+            --arg customer_id=cus-4471 --arg amount=3000
+          PROPOSAL=$(aperture actions -w ci_workspace pending | grep -o 'prp_[a-f0-9]*' | head -1)
+          if aperture actions -w ci_workspace approve "$PROPOSAL" --as svc_support_agent; then
+            echo "an agent approved its own action" && exit 1
+          fi
+          aperture actions -w ci_workspace approve "$PROPOSAL" --as u_kim
+          aperture actions -w ci_workspace execute "$PROPOSAL" -p svc_support_agent
+
       - name: Lineage chain must verify
         run: aperture lineage -w ci_workspace verify
 

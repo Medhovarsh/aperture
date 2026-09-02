@@ -47,6 +47,24 @@ class Reason(str, Enum):
     # Infrastructure
     SOURCE_UNAVAILABLE = "source_unavailable"
 
+    # Action governance (v2)
+    ACTION_NOT_REGISTERED = "action_not_registered"
+    ACTION_NOT_PERMITTED = "action_not_permitted"
+    APPROVAL_REQUIRED = "approval_required"
+    APPROVAL_MISSING = "approval_missing"
+    APPROVAL_DENIED = "approval_denied"
+    IMPACT_LIMIT_EXCEEDED = "impact_limit_exceeded"
+    IRREVERSIBLE_BLOCKED = "irreversible_blocked"
+    PROPOSAL_NOT_FOUND = "proposal_not_found"
+    PROPOSAL_EXPIRED = "proposal_expired"
+    ALREADY_EXECUTED = "already_executed"
+    ARGUMENTS_CHANGED = "arguments_changed"
+    EXECUTION_FAILED = "execution_failed"
+    ROLLBACK_UNSUPPORTED = "rollback_unsupported"
+    INVALID_ARGUMENTS = "invalid_arguments"
+    SELF_APPROVAL_FORBIDDEN = "self_approval_forbidden"
+    APPROVER_NOT_AUTHORIZED = "approver_not_authorized"
+
     def __str__(self) -> str:
         return self.value
 
@@ -55,7 +73,7 @@ HUMAN_READABLE: dict[Reason, str] = {
     Reason.ALLOWED: "allowed by policy",
     Reason.NO_MATCHING_RULE: "no policy rule grants access (default deny)",
     Reason.EXPLICIT_DENY: "an explicit deny rule matched",
-    Reason.PURPOSE_NOT_PERMITTED: "the declared purpose is not permitted for this source",
+    Reason.PURPOSE_NOT_PERMITTED: "the declared purpose is not permitted here",
     Reason.SOURCE_NOT_ELIGIBLE: "principal may not read this source under this purpose",
     Reason.POLICY_ERROR: "policy evaluation failed; denied fail-closed",
     Reason.UNKNOWN_PRINCIPAL: "caller identity is not registered",
@@ -68,6 +86,22 @@ HUMAN_READABLE: dict[Reason, str] = {
     Reason.REDACTED: "one or more fields were redacted by policy",
     Reason.BUDGET_TRUNCATED: "dropped to fit the response token budget",
     Reason.SOURCE_UNAVAILABLE: "source could not be queried",
+    Reason.ACTION_NOT_REGISTERED: "action is not registered in the action catalog",
+    Reason.ACTION_NOT_PERMITTED: "no policy rule permits this principal to take this action",
+    Reason.APPROVAL_REQUIRED: "a human must approve this action before it can run",
+    Reason.APPROVAL_MISSING: "execution attempted without an approval decision",
+    Reason.APPROVAL_DENIED: "a human reviewer rejected this action",
+    Reason.IMPACT_LIMIT_EXCEEDED: "estimated impact exceeds the limit set by policy",
+    Reason.IRREVERSIBLE_BLOCKED: "action cannot be undone and policy forbids it here",
+    Reason.PROPOSAL_NOT_FOUND: "no such proposal",
+    Reason.PROPOSAL_EXPIRED: "proposal is older than the execution window",
+    Reason.ALREADY_EXECUTED: "proposal has already been executed",
+    Reason.ARGUMENTS_CHANGED: "arguments differ from the approved proposal",
+    Reason.EXECUTION_FAILED: "the action failed while running",
+    Reason.ROLLBACK_UNSUPPORTED: "this action declares no compensating operation",
+    Reason.INVALID_ARGUMENTS: "arguments do not match the action's declared parameters",
+    Reason.SELF_APPROVAL_FORBIDDEN: "the proposer may not approve their own action",
+    Reason.APPROVER_NOT_AUTHORIZED: "this identity may not approve this action",
 }
 
 

@@ -50,7 +50,7 @@ def test_index_has_no_external_asset_references(client: TestClient) -> None:
 def test_identities_lists_workspace_configuration(client: TestClient) -> None:
     data = client.get("/api/identities").json()
     assert {p["id"] for p in data["principals"]} == {
-        "u_dana", "u_raj", "u_kim", "svc_support_agent", "u_sam", "u_partner"
+        "u_dana", "u_raj", "u_kim", "svc_support_agent", "u_ops", "u_sam", "u_partner"
     }
     assert "hr_support" in data["purposes"]
 
