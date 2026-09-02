@@ -147,6 +147,13 @@ jobs:
           messages = [json.loads(line) for line in sys.stdin]
           assert messages[0]['result']['serverInfo']['name'] == 'aperture'
           names = {tool['name'] for tool in messages[1]['result']['tools']}
-          assert names == {'context_search', 'context_fetch', 'catalog_list_sources', 'access_explain'}, names
+          expected = {
+              'context_search', 'context_fetch', 'catalog_list_sources', 'access_explain',
+              'action_list', 'action_propose', 'action_execute', 'action_status',
+          }
+          assert names == expected, names
+          # Approval must never be reachable from anything a prompt can influence.
+          forbidden = {'action_approve', 'action_deny', 'action_decide', 'action_rollback'}
+          assert not (names & forbidden), names & forbidden
           print('MCP contract OK:', sorted(names))
           "
