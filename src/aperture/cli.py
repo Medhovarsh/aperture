@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -152,16 +153,49 @@ def cmd_lineage(args: argparse.Namespace) -> int:
     workspace = Workspace.load(args.workspace)
     log = workspace.lineage
 
+    secret = os.environ.get(args.secret_env) if getattr(args, "secret_env", None) else None
+
     if args.action == "verify":
         ok, problems = log.verify()
         entries = len(list(log.read_all()))
+
+        # Recomputation catches edits. Only a signed checkpoint held elsewhere
+        # catches truncation or a wholesale rewrite.
+        if secret:
+            anchored_ok, anchored_problems = log.verify_against_checkpoints(secret)
+            ok = ok and anchored_ok
+            problems = problems + anchored_problems
+
         if ok:
-            print(f"Lineage chain intact across {entries} entries.")
+            checked = f" against {len(log.read_checkpoints())} checkpoint(s)" if secret else ""
+            print(f"Lineage chain intact across {entries} entries{checked}.")
+            if not secret and log.read_checkpoints():
+                print(
+                    "  note: checkpoints exist but were not verified; pass --secret-env",
+                    file=sys.stderr,
+                )
             return 0
         print(f"LINEAGE CHAIN BROKEN ({len(problems)} problem(s)):", file=sys.stderr)
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
         return 1
+
+    if args.action == "checkpoint":
+        if not secret:
+            print(f"{args.secret_env} is not set", file=sys.stderr)
+            return 1
+        entry = log.checkpoint(secret)
+        print(f"checkpoint written: seq {entry['seq']}  hash {entry['hash'][:16]}")
+        print(f"  {log.checkpoint_path}")
+        print("  Ship this somewhere the log's writer cannot reach.")
+        return 0
+
+    if args.action == "export":
+        # Newline-delimited JSON is what every SIEM ingests without a custom parser.
+        for entry in log.read_all():
+            if entry.get("seq", 0) > args.since:
+                print(json.dumps(entry, default=str))
+        return 0
 
     for entry in log.tail(args.limit):
         withheld = ", ".join(f"{w['count']}x{w['reason']}" for w in entry.get("withheld", []))
@@ -297,6 +331,19 @@ def cmd_actions(args: argparse.Namespace) -> int:
         print(f"  result: {result.rollback_result}")
         return 0
 
+    if action == "stuck":
+        stranded = workspace.action_store.stuck_executions(args.older_than)
+        if not stranded:
+            print("No proposals are stranded mid-execution.")
+            return 0
+        print(f"{len(stranded)} proposal(s) stranded mid-execution.")
+        print("These are NOT retried automatically: the action's outcome is unknown,")
+        print("so retrying may double-charge and abandoning may strand an operation.\n")
+        for proposal in stranded:
+            print(f"  {proposal.id}  {proposal.action_id}  by {proposal.principal_id}")
+            print(f"    {proposal.blast.headline()}")
+        return 1
+
     if action == "history":
         records: list[ExecutionRecord] = workspace.action_store.list_executions()
         if not records:
@@ -315,12 +362,37 @@ def cmd_serve(args: argparse.Namespace) -> int:
     """Run the MCP server over stdio."""
     from .mcp_server import serve_stdio
 
+    secret = os.environ.get(args.signing_secret_env) if args.signing_secret_env else None
+    if args.signing_secret_env and not secret:
+        print(
+            f"identity mode 'signed' requires {args.signing_secret_env} to be set",
+            file=sys.stderr,
+        )
+        return 1
+
     serve_stdio(
         workspace_root=args.workspace,
         principal_id=args.principal,
         default_purpose=args.purpose,
         allow_principal_override=args.allow_principal_override,
+        signing_secret=secret,
     )
+    return 0
+
+
+def cmd_assertion(args: argparse.Namespace) -> int:
+    """Mint a signed caller assertion.
+
+    Belongs to whatever issues identity in a real deployment - a gateway or IdP
+    exchange. Exposed here so the flow is testable and demonstrable end to end.
+    """
+    from .assertions import sign_assertion
+
+    secret = os.environ.get(args.secret_env)
+    if not secret:
+        print(f"{args.secret_env} is not set", file=sys.stderr)
+        return 1
+    print(sign_assertion(secret, args.principal, args.purpose, ttl_seconds=args.ttl))
     return 0
 
 
@@ -375,8 +447,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     lineage = subparsers.add_parser("lineage", help="inspect or verify the access log")
     add_workspace(lineage)
-    lineage.add_argument("action", choices=["tail", "verify"], default="tail", nargs="?")
+    lineage.add_argument(
+        "action", choices=["tail", "verify", "checkpoint", "export"], default="tail", nargs="?"
+    )
     lineage.add_argument("--limit", type=int, default=20)
+    lineage.add_argument("--since", type=int, default=0, help="export entries after this seq")
+    lineage.add_argument(
+        "--secret-env", default=None, metavar="VAR",
+        help="environment variable holding the checkpoint signing secret",
+    )
     lineage.set_defaults(func=cmd_lineage)
 
     actions = subparsers.add_parser("actions", help="govern what agents may do")
@@ -420,6 +499,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     action_subparsers.add_parser("history", help="everything that has been executed")
 
+    act_stuck = action_subparsers.add_parser(
+        "stuck", help="proposals stranded mid-execution, for a human to resolve"
+    )
+    act_stuck.add_argument("--older-than", type=int, default=300, metavar="SECONDS")
+
     serve = subparsers.add_parser("serve", help="run the MCP server over stdio")
     add_workspace(serve)
     serve.add_argument(
@@ -434,7 +518,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-principal-override", action="store_true",
         help="permit tool calls to specify a principal (local development only)",
     )
+    serve.add_argument(
+        "--signing-secret-env", default=None, metavar="VAR",
+        help=(
+            "environment variable holding the assertion signing secret; when set, "
+            "every tool call must carry a signed caller assertion"
+        ),
+    )
     serve.set_defaults(func=cmd_serve)
+
+    assertion = subparsers.add_parser(
+        "assertion", help="mint a signed caller assertion (issuer side)"
+    )
+    assertion.add_argument("-p", "--principal", required=True)
+    assertion.add_argument("--purpose", required=True)
+    assertion.add_argument("--ttl", type=int, default=120, help="seconds until expiry")
+    assertion.add_argument("--secret-env", default="APERTURE_SIGNING_SECRET", metavar="VAR")
+    assertion.set_defaults(func=cmd_assertion)
 
     return parser
 

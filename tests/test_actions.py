@@ -336,3 +336,70 @@ def test_reads_and_actions_share_one_chain(workspace: Workspace) -> None:
     assert [entry.get("kind", "search") for entry in entries] == ["search", "action_proposed"]
     ok, _ = workspace.lineage.verify()
     assert ok
+
+
+# --------------------------------------------------------------------------- #
+# rolling-window budgets
+# --------------------------------------------------------------------------- #
+
+
+def test_spend_budget_stops_a_retry_loop(gateway: ActionGateway, workspace: Workspace) -> None:
+    """Per-call limits alone leave the obvious hole: many separately-legal calls.
+
+    The demo policy allows 100 USD per refund but only 500 USD per rolling hour.
+    Five 90 USD refunds are individually fine and collectively at the ceiling.
+    """
+    outcomes = []
+    for _ in range(7):
+        proposal = propose(gateway, arguments={"customer_id": "cus-5510", "amount": 90.0})
+        if isinstance(proposal, ActionRefusal):
+            outcomes.append(proposal.reason)
+            continue
+        result = gateway.execute(proposal.id, "svc_support_agent")
+        outcomes.append("executed" if isinstance(result, ExecutionRecord) else result.reason)
+
+    assert outcomes[:5] == ["executed"] * 5
+    assert outcomes[5:] == [Reason.SPEND_LIMIT_EXCEEDED] * 2
+    assert len(ops_rows(workspace, "SELECT id FROM refunds")) == 5
+
+
+def test_action_count_ceiling_is_enforced_independently(gateway: ActionGateway) -> None:
+    """Five small refunds hit the count ceiling before the amount ceiling."""
+    for _ in range(5):
+        proposal = propose(gateway, arguments={"customer_id": "cus-5510", "amount": 1.0})
+        gateway.execute(proposal.id, "svc_support_agent")
+
+    refusal = propose(gateway, arguments={"customer_id": "cus-5510", "amount": 1.0})
+    assert isinstance(refusal, ActionRefusal)
+    assert refusal.reason is Reason.RATE_LIMIT_EXCEEDED
+
+
+def test_budget_is_rechecked_at_execution_time(gateway: ActionGateway) -> None:
+    """A proposal made under budget must not execute after the budget is spent."""
+    early = propose(gateway, arguments={"customer_id": "cus-5510", "amount": 90.0})
+    assert isinstance(early, Proposal)
+
+    for _ in range(5):
+        other = propose(gateway, arguments={"customer_id": "cus-5510", "amount": 90.0})
+        if isinstance(other, Proposal):
+            gateway.execute(other.id, "svc_support_agent")
+
+    refusal = gateway.execute(early.id, "svc_support_agent")
+    assert isinstance(refusal, ActionRefusal)
+    assert refusal.reason is Reason.SPEND_LIMIT_EXCEEDED
+
+
+def test_rolled_back_actions_still_consume_budget(
+    gateway: ActionGateway, workspace: Workspace
+) -> None:
+    """An action performed and then reversed really did move money twice."""
+    proposal = propose(gateway, arguments={"customer_id": "cus-5510", "amount": 90.0})
+    record = gateway.execute(proposal.id, "svc_support_agent")
+    gateway.rollback(record.id, "u_kim")
+
+    spent, count = workspace.action_store.spend_since(
+        "svc_support_agent", "support.refund",
+        datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    assert spent == 90.0
+    assert count == 1

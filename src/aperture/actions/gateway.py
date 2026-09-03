@@ -15,11 +15,18 @@ Four properties are enforced here and tested as attacks in the red-team suite:
   one proposer, and it expires. Policy is re-evaluated at execution time, so a
   permission revoked between approval and execution stops the action.
 * **Every outcome is logged**, including refusals, in the same hash chain as reads.
+
+Executors are treated as untrusted code at the boundary. A real one calls a payment
+API or a ticketing SDK and can raise anything at all - a timeout, a socket error, a
+library-specific exception this module has never heard of. Every such fault is caught
+and converted into a refusal with a reason code, because a gateway that propagates an
+exception mid-action leaves the caller with no record of what happened and no idea
+whether the action took effect.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..lineage import LineageLog
@@ -98,6 +105,47 @@ class ActionGateway:
             )
         return visible
 
+    def _check_budgets(
+        self,
+        principal_id: str,
+        action_id: str,
+        matched_rules: tuple[str, ...],
+        amount: float,
+        now: datetime | None = None,
+    ) -> Reason | None:
+        """Enforce rolling-window ceilings across every grant that applied.
+
+        Per-call limits are not enough on their own. A hundred separately-legal
+        100 USD refunds are still 10,000 USD, and an agent stuck in a retry loop
+        will find that out faster than a human will. Windows bound the total.
+
+        Unlike per-call grants, windows are conjunctive: every matching rule's
+        ceiling must hold. A grant that tolerates a single call says nothing about
+        whether the caller has already spent its allowance today.
+        """
+        rules = {rule.id: rule for rule in self.policy.rules}
+        reference = now or datetime.now(timezone.utc)
+
+        for rule_id in matched_rules:
+            rule = rules.get(rule_id)
+            if rule is None:
+                continue
+            if rule.max_amount_per_window is None and rule.max_actions_per_window is None:
+                continue
+            since = reference - timedelta(seconds=rule.window_seconds)
+            spent, count = self.store.spend_since(principal_id, action_id, since)
+            if (
+                rule.max_amount_per_window is not None
+                and spent + amount > rule.max_amount_per_window
+            ):
+                return Reason.SPEND_LIMIT_EXCEEDED
+            if (
+                rule.max_actions_per_window is not None
+                and count + 1 > rule.max_actions_per_window
+            ):
+                return Reason.RATE_LIMIT_EXCEEDED
+        return None
+
     # -- propose ---------------------------------------------------------- #
 
     def propose(
@@ -130,7 +178,7 @@ class ActionGateway:
 
         try:
             blast = self._estimate(spec, arguments)
-        except (ExecutorError, KeyError, ValueError, TypeError) as exc:
+        except Exception as exc:  # noqa: BLE001 - executor faults are refusals, not crashes
             return self._refuse(
                 Reason.EXECUTION_FAILED, principal_id, action_id=action_id,
                 purpose=purpose, detail=str(exc),
@@ -147,6 +195,15 @@ class ActionGateway:
         if not verdict.permitted:
             return self._refuse(
                 verdict.reason, principal_id, action_id=action_id, purpose=purpose,
+                detail=blast.headline(),
+            )
+
+        breach = self._check_budgets(
+            principal.id, spec.id, verdict.matched_rules, blast.amount
+        )
+        if breach is not None:
+            return self._refuse(
+                breach, principal_id, action_id=action_id, purpose=purpose,
                 detail=blast.headline(),
             )
 
@@ -281,6 +338,12 @@ class ActionGateway:
             return self._refuse(Reason.APPROVAL_DENIED, principal_id, proposal_id=proposal_id)
         if proposal.state is ProposalState.PENDING_APPROVAL:
             return self._refuse(Reason.APPROVAL_MISSING, principal_id, proposal_id=proposal_id)
+        if proposal.state is ProposalState.EXECUTING:
+            return self._refuse(
+                Reason.PROPOSAL_IN_FLIGHT, principal_id, proposal_id=proposal_id
+            )
+        if proposal.state is ProposalState.ROLLED_BACK:
+            return self._refuse(Reason.ALREADY_EXECUTED, principal_id, proposal_id=proposal_id)
 
         if proposal.age_seconds(now) > self.policy.defaults.proposal_ttl_seconds:
             return self._refuse(Reason.PROPOSAL_EXPIRED, principal_id, proposal_id=proposal_id)
@@ -313,6 +376,15 @@ class ActionGateway:
                 verdict.reason, principal_id, proposal_id=proposal_id, action_id=spec.id
             )
 
+        breach = self._check_budgets(
+            principal.id, spec.id, verdict.matched_rules, proposal.blast.amount, now
+        )
+        if breach is not None:
+            return self._refuse(
+                breach, principal_id, proposal_id=proposal_id, action_id=spec.id,
+                detail=proposal.blast.headline(),
+            )
+
         executor = self.executors.get(spec.executor)
         if executor is None:
             return self._refuse(
@@ -320,9 +392,21 @@ class ActionGateway:
                 detail=f"no executor named {spec.executor}",
             )
 
+        # Atomically claim the proposal. Exactly one caller can win this, which is
+        # what stops two concurrent callers from both acting on one approval.
+        # Everything above this line is a check; everything below it is a side effect.
+        if not self.store.claim_for_execution(proposal.id):
+            return self._refuse(
+                Reason.PROPOSAL_IN_FLIGHT, principal_id, proposal_id=proposal_id,
+                action_id=spec.id,
+            )
+
         try:
             result, compensation = executor.execute(spec, proposal.arguments)
-        except (ExecutorError, KeyError, ValueError, TypeError) as exc:
+        except Exception as exc:  # noqa: BLE001 - see below; any fault must be reported
+            # The executor was entered, so the action may or may not have taken
+            # effect. Leave the proposal in `executing` for a human rather than
+            # releasing it for an automatic retry that could double-charge.
             return self._refuse(
                 Reason.EXECUTION_FAILED, principal_id, proposal_id=proposal_id,
                 action_id=spec.id, detail=str(exc),
@@ -337,7 +421,9 @@ class ActionGateway:
             result=result,
             compensation=compensation,
         )
-        self.store.save_execution(record)
+        self.store.save_execution(
+            record, amount=proposal.blast.amount, affected=proposal.blast.affected
+        )
         self.store.save_proposal(
             proposal.model_copy(
                 update={"state": ProposalState.EXECUTED, "execution_id": record.id}
@@ -383,20 +469,25 @@ class ActionGateway:
         if spec is None or executor is None:
             return self._refuse(Reason.ACTION_NOT_REGISTERED, principal_id)
 
+        # Claim the rollback before compensating, so two concurrent callers cannot
+        # both reverse the same refund.
+        if not self.store.claim_rollback(record.id):
+            return self._refuse(
+                Reason.ALREADY_EXECUTED, principal_id, action_id=record.action_id,
+                detail="this execution was already rolled back",
+            )
+
         try:
             rollback_result = executor.compensate(spec, record.compensation)
-        except (ExecutorError, KeyError, ValueError, TypeError) as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed undo is a refusal, not a crash
+            # Compensation never ran, so the claim is safe to release.
+            self.store.undo_rollback_claim(record.id)
             return self._refuse(
                 Reason.EXECUTION_FAILED, principal_id, action_id=spec.id, detail=str(exc)
             )
 
-        updated = record.model_copy(
-            update={
-                "rolled_back_at": datetime.now(timezone.utc),
-                "rollback_result": rollback_result,
-            }
-        )
-        self.store.save_execution(updated)
+        self.store.record_rollback_result(record.id, rollback_result)
+        updated = self.store.get_execution(record.id) or record
         proposal = self.store.get_proposal(record.proposal_id)
         if proposal is not None:
             self.store.save_proposal(

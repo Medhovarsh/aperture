@@ -64,6 +64,12 @@ class Reason(str, Enum):
     INVALID_ARGUMENTS = "invalid_arguments"
     SELF_APPROVAL_FORBIDDEN = "self_approval_forbidden"
     APPROVER_NOT_AUTHORIZED = "approver_not_authorized"
+    PROPOSAL_IN_FLIGHT = "proposal_in_flight"
+    SPEND_LIMIT_EXCEEDED = "spend_limit_exceeded"
+    RATE_LIMIT_EXCEEDED = "rate_limit_exceeded"
+    INVALID_ASSERTION = "invalid_assertion"
+    ASSERTION_EXPIRED = "assertion_expired"
+    ASSERTION_REPLAYED = "assertion_replayed"
 
     def __str__(self) -> str:
         return self.value
@@ -102,6 +108,12 @@ HUMAN_READABLE: dict[Reason, str] = {
     Reason.INVALID_ARGUMENTS: "arguments do not match the action's declared parameters",
     Reason.SELF_APPROVAL_FORBIDDEN: "the proposer may not approve their own action",
     Reason.APPROVER_NOT_AUTHORIZED: "this identity may not approve this action",
+    Reason.PROPOSAL_IN_FLIGHT: "another caller is already executing this proposal",
+    Reason.SPEND_LIMIT_EXCEEDED: "this would exceed the spend budget for the current window",
+    Reason.RATE_LIMIT_EXCEEDED: "too many actions of this kind in the current window",
+    Reason.INVALID_ASSERTION: "caller assertion is missing, malformed, or badly signed",
+    Reason.ASSERTION_EXPIRED: "caller assertion is outside its validity window",
+    Reason.ASSERTION_REPLAYED: "caller assertion has already been used",
 }
 
 

@@ -36,6 +36,9 @@ class ProposalState(str, Enum):
 
     PENDING_APPROVAL = "pending_approval"
     READY = "ready"
+    # Claimed by exactly one caller and currently running. A proposal stuck here
+    # after a crash needs a human: the action's outcome is unknown.
+    EXECUTING = "executing"
     EXECUTED = "executed"
     DENIED = "denied"
     ROLLED_BACK = "rolled_back"

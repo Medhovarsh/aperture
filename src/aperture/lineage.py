@@ -9,14 +9,21 @@ This is the artifact an auditor asks for. It answers, for any answer an agent ga
 which identity asked, under what declared purpose, which sources were consulted,
 which records were returned, and what was withheld and why.
 
-The chain is tamper-*evident*, not tamper-*proof*: an attacker with write access can
-rewrite the whole file consistently. Detecting that requires anchoring the head hash
-somewhere the attacker does not control, which is a v2 concern and is not claimed here.
+A bare hash chain is tamper-*evident* only against edits: someone with write access
+can rewrite the whole file consistently and the recomputation still passes. Closing
+that requires anchoring the head hash somewhere they do not control, which is what
+:meth:`LineageLog.checkpoint` does - it emits a signed statement that the chain
+reached a given sequence with a given hash. Ship those to a SIEM, an object store
+with retention lock, or a second account, and a rewritten log stops verifying.
+
+The signing secret must live outside the machine that writes the log. Anchoring to
+a secret an attacker with write access can also read proves nothing.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import uuid
@@ -104,6 +111,85 @@ class LineageLog:
         """Return the most recent entries, oldest first."""
         entries = list(self.read_all())
         return entries[-limit:]
+
+
+    # -- external anchoring ----------------------------------------------- #
+
+    @property
+    def checkpoint_path(self) -> Path:
+        """Where signed checkpoints are written."""
+        return self.path.parent / "checkpoints.jsonl"
+
+    def checkpoint(self, secret: str) -> dict[str, Any]:
+        """Sign the current head of the chain.
+
+        The result is meant to be shipped somewhere the log's writer cannot reach.
+        Holding a signed statement that the chain reached sequence N with hash H
+        makes truncation and wholesale rewriting detectable, which recomputation
+        alone cannot do.
+        """
+        if not secret or len(secret) < 16:
+            raise ValueError("checkpoint secret must be at least 16 characters")
+        head_hash, seq = self._head()
+        body = {
+            "seq": seq,
+            "hash": head_hash,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        payload = _canonical(body)
+        body["signature"] = hmac.new(
+            secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.checkpoint_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(body) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return body
+
+    def read_checkpoints(self) -> list[dict[str, Any]]:
+        """Every checkpoint recorded for this log."""
+        if not self.checkpoint_path.is_file():
+            return []
+        return [
+            json.loads(line)
+            for line in self.checkpoint_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def verify_against_checkpoints(self, secret: str) -> tuple[bool, list[str]]:
+        """Check the chain against every signed checkpoint.
+
+        Catches the two attacks a self-contained chain cannot: truncating the log,
+        and rewriting it end to end with valid internal hashes.
+        """
+        problems: list[str] = []
+        entries = {int(entry["seq"]): entry for entry in self.read_all()}
+
+        for checkpoint in self.read_checkpoints():
+            body = {k: v for k, v in checkpoint.items() if k != "signature"}
+            expected = hmac.new(
+                secret.encode("utf-8"), _canonical(body).encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(expected, str(checkpoint.get("signature", ""))):
+                problems.append(f"checkpoint at seq {checkpoint.get('seq')} is not correctly signed")
+                continue
+
+            seq = int(checkpoint["seq"])
+            if seq == 0:
+                continue
+            entry = entries.get(seq)
+            if entry is None:
+                problems.append(
+                    f"log has been truncated: checkpoint covers seq {seq}, which is missing"
+                )
+            elif entry.get("hash") != checkpoint["hash"]:
+                problems.append(
+                    f"log has been rewritten: seq {seq} no longer matches its signed checkpoint"
+                )
+
+        return (not problems), problems
 
     # -- integrity -------------------------------------------------------- #
 

@@ -24,6 +24,7 @@ from typing import Any, Callable, TextIO
 
 from .actions.gateway import ActionGateway
 from .actions.types import ActionRefusal, Proposal
+from .assertions import AssertionFailure, AssertionVerifier
 from .plane import ContextPlane
 from .types import ResultRecord, SearchRequest, WithheldGroup
 from .workspace import Workspace
@@ -169,6 +170,27 @@ TOOLS: list[dict[str, Any]] = [
 # the CLI or a review UI.
 
 
+def with_assertion_argument(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add the assertion argument to every tool schema.
+
+    Used when the server runs in signed-identity mode, so a client discovers that
+    it must present a token rather than finding out through a refusal.
+    """
+    extended: list[dict[str, Any]] = []
+    for tool in tools:
+        schema = json.loads(json.dumps(tool["inputSchema"]))
+        schema.setdefault("properties", {})["assertion"] = {
+            "type": "string",
+            "description": (
+                "Signed caller assertion proving who is acting and for what purpose. "
+                "Single use; expires quickly."
+            ),
+        }
+        schema["required"] = sorted(set(schema.get("required", [])) | {"assertion"})
+        extended.append({**tool, "inputSchema": schema})
+    return extended
+
+
 def _render_action_result(result: "Proposal | ActionRefusal") -> dict[str, Any]:
     """Shape a proposal or refusal for the model, with the next step spelled out."""
     if isinstance(result, ActionRefusal):
@@ -258,9 +280,13 @@ class ApertureMCPServer:
         default_purpose: str | None = None,
         allow_principal_override: bool = False,
         gateway: ActionGateway | None = None,
+        verifier: AssertionVerifier | None = None,
     ) -> None:
         self.plane = plane
         self.gateway = gateway
+        # When a verifier is configured the server serves many identities, each
+        # proved per call by a signed assertion, instead of one fixed principal.
+        self.verifier = verifier
         self.principal_id = principal_id
         self.default_purpose = default_purpose
         self.allow_principal_override = allow_principal_override
@@ -273,13 +299,50 @@ class ApertureMCPServer:
 
     # -- identity --------------------------------------------------------- #
 
-    def _resolve_principal(self, arguments: dict[str, Any]) -> str:
-        """Return the acting principal, honoring override only when enabled."""
-        if self.allow_principal_override:
-            return str(arguments.get("principal") or self.principal_id)
-        return self.principal_id
+    def _resolve_identity(self, arguments: dict[str, Any]) -> tuple[str, str]:
+        """Return the acting (principal, purpose) for one tool call.
+
+        Three modes, in descending order of trustworthiness:
+
+        1. **Signed assertion.** A trusted issuer vouched for this identity and
+           purpose together, and the token is single use. The caller cannot widen
+           either one, because both are covered by the signature.
+        2. **Server-pinned identity.** One process serves one principal. The agent
+           cannot choose.
+        3. **Caller-asserted identity.** Local development only, and the flag that
+           enables it says so.
+        """
+        if self.verifier is not None:
+            token = arguments.get("assertion")
+            if not token:
+                raise ValueError(
+                    "this server requires a signed caller assertion; pass 'assertion'"
+                )
+            result = self.verifier.verify(str(token))
+            if isinstance(result, AssertionFailure):
+                raise ValueError(f"{result.reason}: {result.detail}")
+            return result.principal_id, result.purpose
+
+        principal = (
+            str(arguments.get("principal") or self.principal_id)
+            if self.allow_principal_override
+            else self.principal_id
+        )
+        purpose = arguments.get("purpose") or self.default_purpose
+        if not purpose:
+            raise ValueError(
+                "no purpose declared and this server has no default purpose configured"
+            )
+        return principal, str(purpose)
 
     def _resolve_purpose(self, arguments: dict[str, Any]) -> str:
+        """Purpose for one call, after identity has already been resolved.
+
+        Deliberately does no verification. An assertion is single use, so it is
+        checked exactly once per call in :meth:`_dispatch_tool`, which then injects
+        the resolved purpose into the arguments this reads. Verifying again here
+        would make every signed call fail as its own replay.
+        """
         purpose = arguments.get("purpose") or self.default_purpose
         if not purpose:
             raise ValueError(
@@ -307,9 +370,12 @@ class ApertureMCPServer:
 
         A read-only workspace should not show an agent verbs it can never use.
         """
+        tools = TOOLS
         if self.gateway is None or not len(self.gateway.catalog):
-            return {"tools": [tool for tool in TOOLS if not tool["name"].startswith("action_")]}
-        return {"tools": TOOLS}
+            tools = [tool for tool in tools if not tool["name"].startswith("action_")]
+        if self.verifier is not None:
+            tools = with_assertion_argument(tools)
+        return {"tools": tools}
 
     def _tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
@@ -329,7 +395,9 @@ class ApertureMCPServer:
         }
 
     def _dispatch_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        principal = self._resolve_principal(arguments)
+        # Resolved once per call: a single-use assertion must not be verified twice.
+        principal, purpose = self._resolve_identity(arguments)
+        arguments = {**arguments, "purpose": purpose}
 
         if name == "context_search":
             question = arguments.get("question")
@@ -495,6 +563,7 @@ def serve_stdio(
     principal_id: str,
     default_purpose: str | None = None,
     allow_principal_override: bool = False,
+    signing_secret: str | None = None,
 ) -> None:
     """Load a workspace and serve it over stdio.
 
@@ -503,7 +572,12 @@ def serve_stdio(
     """
     workspace = Workspace.load(workspace_root)
     plane = ContextPlane(workspace)
-    if workspace.principals.get(principal_id) is None:
+    verifier = (
+        AssertionVerifier(signing_secret, nonce_store=workspace.action_store)
+        if signing_secret
+        else None
+    )
+    if verifier is None and workspace.principals.get(principal_id) is None:
         raise SystemExit(
             f"principal '{principal_id}' is not registered in this workspace"
         )
@@ -513,5 +587,6 @@ def serve_stdio(
         default_purpose=default_purpose,
         allow_principal_override=allow_principal_override,
         gateway=workspace.gateway() if len(workspace.actions) else None,
+        verifier=verifier,
     )
     server.run(sys.stdin, sys.stdout)

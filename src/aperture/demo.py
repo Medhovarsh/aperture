@@ -214,12 +214,18 @@ rules:
 
   - id: support-small-refunds
     effect: allow
-    description: Support may refund up to 100 USD without asking anyone.
+    description: >-
+      Support may refund up to 100 USD without asking anyone, but no more than
+      500 USD or 5 refunds in a rolling hour. Per-call limits alone would let a
+      retry loop issue a hundred separately-legal refunds.
     when:
       groups: [support]
       purposes: [customer_support]
       actions: [support.refund]
     max_amount: 100
+    window_seconds: 3600
+    max_amount_per_window: 500
+    max_actions_per_window: 5
 
   - id: support-large-refunds
     effect: allow

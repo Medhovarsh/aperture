@@ -83,6 +83,13 @@ class Rule(BaseModel):
     max_affected: int | None = None
     allow_irreversible: bool = True
 
+    # Aggregate ceilings over a rolling window. Per-action limits alone leave the
+    # obvious hole open: a hundred separately-legal refunds are still a hundred
+    # refunds. These bound the total, not the individual call.
+    window_seconds: int = 86400
+    max_amount_per_window: float | None = None
+    max_actions_per_window: int | None = None
+
     @field_validator("redact_fields", mode="before")
     @classmethod
     def _coerce_fields(cls, v: Any) -> Any:

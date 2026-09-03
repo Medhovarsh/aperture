@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from aperture.lineage import GENESIS_HASH, LineageLog
 from aperture.plane import ContextPlane
 from aperture.types import SearchRequest
@@ -94,3 +96,73 @@ def test_unknown_principal_attempt_is_logged(plane: ContextPlane) -> None:
     assert entry is not None
     assert entry["principal_id"] == "mallory"
     assert entry["tenant"] is None
+
+
+# --------------------------------------------------------------------------- #
+# external anchoring
+# --------------------------------------------------------------------------- #
+
+ANCHOR_SECRET = "checkpoint-secret-long-enough"
+
+
+def test_checkpoint_signs_the_current_head(tmp_path: Path) -> None:
+    log = LineageLog(tmp_path / "access.jsonl")
+    for index in range(3):
+        log.append({"trace_id": f"t{index}"})
+    checkpoint = log.checkpoint(ANCHOR_SECRET)
+    assert checkpoint["seq"] == 3
+    ok, problems = log.verify_against_checkpoints(ANCHOR_SECRET)
+    assert ok, problems
+
+
+def test_weak_checkpoint_secret_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="at least 16"):
+        LineageLog(tmp_path / "access.jsonl").checkpoint("short")
+
+
+def test_checkpoint_detects_a_wholesale_rewrite(tmp_path: Path) -> None:
+    """The attack a self-contained hash chain provably cannot catch.
+
+    Rewriting the file end to end produces a chain that verifies against itself.
+    Only a signature held elsewhere shows that history was replaced.
+    """
+    path = tmp_path / "access.jsonl"
+    log = LineageLog(path)
+    for index in range(4):
+        log.append({"trace_id": f"real{index}", "principal_id": "u_kim"})
+    log.checkpoint(ANCHOR_SECRET)
+
+    path.write_text("", encoding="utf-8")
+    forged = LineageLog(path)
+    forged.append({"trace_id": "innocent", "principal_id": "u_kim"})
+
+    assert forged.verify()[0] is True, "the chain alone cannot detect this"
+
+    ok, problems = forged.verify_against_checkpoints(ANCHOR_SECRET)
+    assert not ok
+    assert any("truncated" in problem or "rewritten" in problem for problem in problems)
+
+
+def test_checkpoint_detects_truncation(tmp_path: Path) -> None:
+    path = tmp_path / "access.jsonl"
+    log = LineageLog(path)
+    for index in range(5):
+        log.append({"trace_id": f"t{index}"})
+    log.checkpoint(ANCHOR_SECRET)
+
+    lines = path.read_text(encoding="utf-8").splitlines()[:3]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    ok, problems = log.verify_against_checkpoints(ANCHOR_SECRET)
+    assert not ok
+    assert any("truncated" in problem for problem in problems)
+
+
+def test_forged_checkpoint_signature_is_rejected(tmp_path: Path) -> None:
+    log = LineageLog(tmp_path / "access.jsonl")
+    log.append({"trace_id": "t0"})
+    log.checkpoint(ANCHOR_SECRET)
+
+    ok, problems = log.verify_against_checkpoints("a-completely-different-secret")
+    assert not ok
+    assert any("not correctly signed" in problem for problem in problems)

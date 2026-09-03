@@ -18,9 +18,9 @@ from aperture import playground  # noqa: E402
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    """A client backed by a workspace in a temp directory, isolated per test."""
-    monkeypatch.setattr(playground, "_plane", None)
-    monkeypatch.setattr(playground.tempfile, "gettempdir", lambda: str(tmp_path))
+    """A client with its own session pool rooted in a temp directory."""
+    monkeypatch.setattr(playground, "sessions", playground.SessionPool(tmp_path / "sessions"))
+    monkeypatch.setattr(playground, "limiter", playground.RateLimiter())
     return TestClient(playground.app)
 
 
@@ -219,3 +219,115 @@ def test_operations_state_is_exposed_so_effects_are_visible(client: TestClient) 
     state = client.get("/api/state").json()
     assert {"customers", "tickets", "refunds", "messages"} == set(state)
     assert any(row["region"] == "legacy" for row in state["customers"])
+
+
+# --------------------------------------------------------------------------- #
+# production hardening
+# --------------------------------------------------------------------------- #
+
+
+def test_liveness_and_readiness_answer_different_questions(client: TestClient) -> None:
+    assert client.get("/healthz").text == "ok"
+    ready = client.get("/readyz")
+    assert ready.status_code == 200
+    body = ready.json()
+    assert body["ready"] is True
+    assert body["sources"] == 4
+    assert body["lineage_chain_intact"] is True
+
+
+def test_security_headers_are_set_on_every_response(client: TestClient) -> None:
+    headers = client.get("/").headers
+    assert "default-src 'none'" in headers["content-security-policy"]
+    assert headers["x-content-type-options"] == "nosniff"
+    assert headers["x-frame-options"] == "DENY"
+    assert headers["referrer-policy"] == "no-referrer"
+
+
+def test_page_loads_nothing_the_policy_would_block(client: TestClient) -> None:
+    """The CSP forbids external resources; the page must not need any."""
+    body = client.get("/").text
+    assert "<script src=" not in body
+    assert "<link rel=\"stylesheet\"" not in body
+
+
+def test_visitors_do_not_share_state(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Actions mutate real state, so one visitor's refund must not reach another.
+
+    A shared workspace would also mean a shared rate limit and a shared audit log.
+    """
+    monkeypatch.setattr(playground, "sessions", playground.SessionPool(tmp_path / "s"))
+    monkeypatch.setattr(playground, "limiter", playground.RateLimiter())
+    first, second = TestClient(playground.app), TestClient(playground.app)
+
+    proposal = first.post(
+        "/api/actions/propose",
+        json={
+            "principal_id": "svc_support_agent",
+            "purpose": "customer_support",
+            "action_id": "support.refund",
+            "arguments": {"customer_id": "cus-5510", "amount": 20},
+        },
+    ).json()
+    first.post(
+        "/api/actions/execute",
+        json={"proposal_id": proposal["proposal_id"], "principal_id": "svc_support_agent"},
+    )
+
+    assert len(first.get("/api/state").json()["refunds"]) == 1
+    assert second.get("/api/state").json()["refunds"] == []
+
+
+def test_session_pool_evicts_rather_than_growing_without_bound(tmp_path) -> None:
+    """A crawler must not be able to fill the disk one session at a time."""
+    pool = playground.SessionPool(tmp_path / "sessions", capacity=3)
+    for index in range(6):
+        pool.get(f"session-{index}")
+    assert pool.size == 3
+    assert not (tmp_path / "sessions" / "session-0").exists()
+    assert (tmp_path / "sessions" / "session-5").exists()
+
+
+def test_action_requests_are_rate_limited(client: TestClient) -> None:
+    payload = {
+        "principal_id": "svc_support_agent",
+        "purpose": "customer_support",
+        "action_id": "support.refund",
+        "arguments": {"customer_id": "cus-5510", "amount": 1},
+    }
+    statuses = [
+        client.post("/api/actions/propose", json=payload).status_code
+        for _ in range(playground.ACTION_LIMIT + 5)
+    ]
+    assert 429 in statuses
+    assert statuses.count(200) == playground.ACTION_LIMIT
+
+
+def test_rate_limited_response_explains_itself(client: TestClient) -> None:
+    payload = {
+        "principal_id": "svc_support_agent",
+        "purpose": "customer_support",
+        "action_id": "support.close_ticket",
+        "arguments": {"ticket_id": "tkt-1180"},
+    }
+    for _ in range(playground.ACTION_LIMIT + 1):
+        response = client.post("/api/actions/propose", json=payload)
+    assert response.status_code == 429
+    body = response.json()
+    assert body["reason"] == "rate_limit_exceeded"
+    assert "requests" in body["explanation"]
+
+
+def test_reads_and_actions_have_separate_budgets(client: TestClient) -> None:
+    """Exploring the search box must not exhaust the allowance for the half that writes."""
+    for _ in range(playground.ACTION_LIMIT + 2):
+        client.post(
+            "/api/actions/propose",
+            json={
+                "principal_id": "svc_support_agent",
+                "purpose": "customer_support",
+                "action_id": "support.refund",
+                "arguments": {"customer_id": "cus-5510", "amount": 1},
+            },
+        )
+    assert client.get("/api/identities").status_code == 200

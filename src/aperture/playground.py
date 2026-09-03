@@ -1,54 +1,139 @@
 """Hosted demo playground.
 
-A thin HTTP wrapper over :class:`~aperture.plane.ContextPlane` plus a single-page UI,
-so the product thesis is visible in twenty seconds without cloning anything: pick an
-identity, pick a purpose, ask a question, watch records appear and disappear with
-reason codes attached.
+A thin HTTP wrapper over the plane and the action gateway, plus a single-page UI, so
+the whole thesis is visible in a browser without cloning anything.
 
-This is a **demo surface, not the product**. It deliberately does the one thing the
-real server refuses to do - it lets the caller choose which principal to act as -
-because that is the whole point of a playground. The real MCP server pins identity
-server-side precisely so an agent cannot do this.
+This is a **demo surface, not the product**, and it deliberately does two things the
+real deployment refuses to do: it lets the caller pick an identity, and it exposes
+approval over HTTP. That is the point of a demo, and it is exactly why the MCP server
+does neither.
 
-Everything it serves is synthetic. The workspace is generated into a temp directory
-on first request, and on a serverless host the lineage log lives only for the life of
-that instance.
+What it does *not* relax is isolation. Actions mutate real state, so every visitor
+gets their own workspace keyed to a session cookie. Sharing one workspace would mean
+one visitor's refund showing up in another's tables, and one visitor's rate limit
+being consumed by everyone else.
+
+Production concerns handled here:
+
+* **Session isolation** with a bounded pool and least-recently-used eviction, so a
+  crawler cannot fill the disk one session at a time.
+* **Rate limiting** per session, tighter for actions than for reads, because actions
+  write.
+* **Security headers**, including a content-security policy that matches what the
+  page actually needs: its own inline style and script, and nothing external.
+* **Liveness and readiness probes** that answer different questions - whether the
+  process is up, and whether it can actually serve a governed request.
 """
 
 from __future__ import annotations
 
+import shutil
 import tempfile
+import threading
+import time
+import uuid
+from collections import OrderedDict, deque
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
+from . import __version__
 from .actions.gateway import ActionGateway
-from .actions.types import ActionRefusal, ExecutionRecord, Proposal
+from .actions.types import ActionRefusal, Proposal
 from .demo import build_demo_workspace
 from .plane import ContextPlane
 from .types import SearchRequest
 from .workspace import Workspace
 
 MAX_QUESTION_LENGTH = 400
+SESSION_COOKIE = "aperture_session"
 
-_plane: ContextPlane | None = None
+#: How many visitor workspaces to keep. Each is a few hundred kilobytes; the cap
+#: turns unbounded growth into bounded churn.
+MAX_SESSIONS = 64
+
+#: Requests per window, per session. Actions are limited separately and harder
+#: because they write.
+READ_LIMIT, READ_WINDOW = 90, 60.0
+ACTION_LIMIT, ACTION_WINDOW = 25, 60.0
+
+_current_session: ContextVar[str] = ContextVar("aperture_session", default="")
+
+
+class SessionPool:
+    """Per-visitor workspaces with a bounded size and LRU eviction."""
+
+    def __init__(self, root: Path | None = None, capacity: int = MAX_SESSIONS) -> None:
+        self.root = Path(root or Path(tempfile.gettempdir()) / "aperture-playground")
+        self.capacity = capacity
+        self._planes: OrderedDict[str, ContextPlane] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, session_id: str) -> ContextPlane:
+        """Return this session's plane, building its workspace on first use."""
+        with self._lock:
+            plane = self._planes.get(session_id)
+            if plane is not None:
+                self._planes.move_to_end(session_id)
+                return plane
+
+            workspace_root = self.root / session_id
+            build_demo_workspace(workspace_root)
+            plane = ContextPlane(Workspace.load(workspace_root))
+            self._planes[session_id] = plane
+
+            while len(self._planes) > self.capacity:
+                evicted_id, _ = self._planes.popitem(last=False)
+                shutil.rmtree(self.root / evicted_id, ignore_errors=True)
+            return plane
+
+    def reset(self) -> None:
+        """Drop every session. Used by tests."""
+        with self._lock:
+            self._planes.clear()
+            shutil.rmtree(self.root, ignore_errors=True)
+
+    @property
+    def size(self) -> int:
+        """Number of live sessions."""
+        return len(self._planes)
+
+
+class RateLimiter:
+    """Fixed-window request counter, keyed by session."""
+
+    def __init__(self) -> None:
+        self._hits: dict[tuple[str, str], deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, bucket: str, limit: int, window: float) -> bool:
+        """Record a hit and report whether it is within the limit."""
+        now = time.monotonic()
+        with self._lock:
+            hits = self._hits.setdefault((key, bucket), deque())
+            while hits and now - hits[0] > window:
+                hits.popleft()
+            if len(hits) >= limit:
+                return False
+            hits.append(now)
+            return True
+
+
+sessions = SessionPool()
+limiter = RateLimiter()
 
 
 def get_plane() -> ContextPlane:
-    """Return the shared plane, generating the demo workspace on first use."""
-    global _plane
-    if _plane is None:
-        root = Path(tempfile.gettempdir()) / "aperture-playground"
-        build_demo_workspace(root)
-        _plane = ContextPlane(Workspace.load(root))
-    return _plane
+    """The current session's plane."""
+    return sessions.get(_current_session.get() or "anonymous")
 
 
 def get_gateway() -> ActionGateway:
-    """Return the action gateway over the same workspace."""
+    """The current session's action gateway."""
     return get_plane().workspace.gateway()
 
 
@@ -103,6 +188,113 @@ app = FastAPI(
     description="Interactive demo of governed, purpose-bound retrieval for AI agents.",
     docs_url="/api/docs",
 )
+
+
+# The page uses its own inline <style> and <script> and loads nothing external, so
+# the policy can be this tight. 'unsafe-inline' is required for inline blocks; there
+# is no user-supplied markup on the page, and every dynamic value is escaped.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "connect-src 'self'; "
+    "img-src 'self' data:; "
+    "base-uri 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'none'"
+)
+
+SECURITY_HEADERS = {
+    "Content-Security-Policy": CONTENT_SECURITY_POLICY,
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+}
+
+
+@app.middleware("http")
+async def session_and_limits(request: Request, call_next):
+    """Bind a session, enforce rate limits, and set security headers.
+
+    Reads and actions get separate budgets. A visitor exploring the search box
+    should not be able to exhaust the allowance for the half of the demo that
+    writes to a database.
+    """
+    session_id = request.cookies.get(SESSION_COOKIE) or uuid.uuid4().hex
+    token = _current_session.set(session_id)
+
+    path = request.url.path
+    is_action = path.startswith("/api/actions")
+    limit, window, bucket = (
+        (ACTION_LIMIT, ACTION_WINDOW, "action") if is_action else (READ_LIMIT, READ_WINDOW, "read")
+    )
+
+    try:
+        if path.startswith("/api/") and not limiter.allow(session_id, bucket, limit, window):
+            response: Response = JSONResponse(
+                {
+                    "refused": True,
+                    "reason": "rate_limit_exceeded",
+                    "explanation": (
+                        f"more than {limit} {bucket} requests in {int(window)} seconds "
+                        "from this session"
+                    ),
+                },
+                status_code=429,
+            )
+        else:
+            response = await call_next(request)
+    finally:
+        _current_session.reset(token)
+
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_id,
+        max_age=3600,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+    )
+    for header, value in SECURITY_HEADERS.items():
+        response.headers[header] = value
+    return response
+
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz() -> str:
+    """Liveness: the process is running and can serve a request."""
+    return "ok"
+
+
+@app.get("/readyz")
+def readyz() -> JSONResponse:
+    """Readiness: a governed request can actually be served end to end.
+
+    Deliberately stronger than liveness. A process that is up but whose workspace
+    will not load should be taken out of rotation, not sent traffic.
+    """
+    try:
+        plane = get_plane()
+        sources = len(plane.workspace.catalog)
+        actions = len(plane.workspace.actions)
+        chain_ok, _ = plane.workspace.lineage.verify()
+    except Exception as exc:  # noqa: BLE001 - readiness must report, not raise
+        return JSONResponse({"ready": False, "error": str(exc)}, status_code=503)
+
+    ready = sources > 0 and chain_ok
+    return JSONResponse(
+        {
+            "ready": ready,
+            "version": __version__,
+            "sources": sources,
+            "actions": actions,
+            "lineage_chain_intact": chain_ok,
+            "live_sessions": sessions.size,
+        },
+        status_code=200 if ready else 503,
+    )
 
 
 @app.get("/api/identities")
