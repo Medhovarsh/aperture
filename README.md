@@ -508,6 +508,12 @@ the HTTP surface and the MCP stdio server work inside it.
 
 ---
 
+## Writeups
+
+- **[Eight threads, one approval, eight refunds](docs/postmortem/2026-09-03-double-spend.md)**
+  — post-mortem of a double-spend race in the action gateway, the audit-log bug that
+  fixing it uncovered, and why the obvious retry "fix" is worse than the original.
+
 ## For security and compliance reviewers
 
 - **[Threat model](docs/THREAT_MODEL.md)** — trust boundaries, five adversaries,
