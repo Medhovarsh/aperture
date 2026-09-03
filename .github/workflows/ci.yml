@@ -298,3 +298,77 @@ jobs:
       - name: Stop
         if: always()
         run: docker rm -f aperture-ci || true
+
+  postgres-backend:
+    name: postgres backend
+    runs-on: ubuntu-latest
+    # The multi-host store is only meaningful if it is exercised against a real
+    # database. A skipped backend is a backend that does not work.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: aperture
+          POSTGRES_USER: aperture
+          POSTGRES_DB: aperture_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      APERTURE_TEST_POSTGRES_DSN: postgresql://aperture:aperture@localhost:5432/aperture_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev,postgres]"
+
+      - name: Both backends must satisfy the same contract
+        run: python -m pytest tests/test_store_backends.py -q -rs
+
+      - name: The Postgres claim must admit exactly one winner
+        run: |
+          set -euo pipefail
+          python - <<'PYCHECK'
+          import os
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import datetime, timezone
+
+          from aperture.actions.postgres_store import PostgresActionStore
+          from aperture.actions.store import new_proposal_id
+          from aperture.actions.types import BlastRadius, Proposal, ProposalState
+
+          dsn = os.environ["APERTURE_TEST_POSTGRES_DSN"]
+
+          # Every "worker" gets its own connection, the way separate machines would.
+          stores = [PostgresActionStore(dsn) for _ in range(8)]
+          proposal = Proposal(
+              id=new_proposal_id(),
+              created_at=datetime.now(timezone.utc),
+              principal_id="svc_support_agent",
+              purpose="customer_support",
+              action_id="support.refund",
+              arguments={"amount": 50.0},
+              arguments_hash="h",
+              blast=BlastRadius(summary="Refund 50 USD", amount=50.0, reversible=True),
+              state=ProposalState.READY,
+              requires_approval=False,
+          )
+          stores[0].save_proposal(proposal)
+
+          with ThreadPoolExecutor(max_workers=8) as pool:
+              won = list(pool.map(lambda s: s.claim_for_execution(proposal.id), stores))
+
+          assert won.count(True) == 1, won
+          print("8 independent connections raced one approval; winners:", won.count(True))
+          for store in stores:
+              store.close()
+          PYCHECK

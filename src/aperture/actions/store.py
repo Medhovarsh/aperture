@@ -22,9 +22,11 @@ may double-charge and abandoning it may strand a half-finished operation.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import uuid
+from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -91,8 +93,96 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, default=str)
 
 
-class ActionStore:
-    """Transactional storage for proposals, executions, and replay nonces."""
+class ActionStore(ABC):
+    """Transactional storage for proposals, executions, and replay nonces.
+
+    The interface exists so a deployment can choose its consistency domain. SQLite
+    serializes across processes on one machine; Postgres serializes across machines.
+    Everything above this class is identical either way, because the guarantee it
+    has to provide is the same: :meth:`claim_for_execution` succeeds for exactly one
+    caller.
+    """
+
+    @abstractmethod
+    def save_proposal(self, proposal: Proposal) -> Proposal:
+        """Insert or replace a proposal."""
+
+    @abstractmethod
+    def get_proposal(self, proposal_id: str) -> Proposal | None:
+        """Return a proposal by id, or None."""
+
+    @abstractmethod
+    def list_proposals(self, state: str | None = None) -> list[Proposal]:
+        """All proposals, newest first, optionally filtered by state."""
+
+    @abstractmethod
+    def transition(
+        self, proposal_id: str, expected: Iterable[ProposalState], new_state: ProposalState
+    ) -> bool:
+        """Atomically move a proposal between states, returning True for the winner."""
+
+    @abstractmethod
+    def save_execution(
+        self, record: ExecutionRecord, amount: float = 0.0, affected: int = 0
+    ) -> ExecutionRecord:
+        """Insert or replace an execution record."""
+
+    @abstractmethod
+    def get_execution(self, execution_id: str) -> ExecutionRecord | None:
+        """Return an execution record by id, or None."""
+
+    @abstractmethod
+    def list_executions(self) -> list[ExecutionRecord]:
+        """All execution records, newest first."""
+
+    @abstractmethod
+    def claim_rollback(self, execution_id: str) -> bool:
+        """Claim an execution for rollback. Exactly one caller can succeed."""
+
+    @abstractmethod
+    def record_rollback_result(self, execution_id: str, result: dict[str, Any]) -> None:
+        """Attach the compensating operation's result to a claimed rollback."""
+
+    @abstractmethod
+    def undo_rollback_claim(self, execution_id: str) -> None:
+        """Release a rollback claim whose compensating call failed."""
+
+    @abstractmethod
+    def spend_since(
+        self, principal_id: str, action_id: str, since: datetime
+    ) -> tuple[float, int]:
+        """Total amount and action count for one principal since a point in time."""
+
+    @abstractmethod
+    def remember_nonce(self, nonce: str, expires_at: datetime) -> bool:
+        """Record a nonce, returning False if it has been seen before."""
+
+    @abstractmethod
+    def stuck_executions(self, older_than_seconds: int = 300) -> list[Proposal]:
+        """Proposals stranded mid-execution, for an operator to inspect."""
+
+    def claim_for_execution(self, proposal_id: str) -> bool:
+        """Claim a ready proposal for execution. Exactly one caller can succeed.
+
+        This is the double-spend guard, and it is deliberately defined once here
+        rather than per backend: every implementation gets it by implementing an
+        atomic :meth:`transition`.
+        """
+        return self.transition(proposal_id, [ProposalState.READY], ProposalState.EXECUTING)
+
+    def release_claim(self, proposal_id: str) -> bool:
+        """Return a claimed proposal to ready after a pre-execution failure.
+
+        Only for failures that provably happened before the executor was entered.
+        """
+        return self.transition(proposal_id, [ProposalState.EXECUTING], ProposalState.READY)
+
+    def close(self) -> None:
+        """Release any resources held by this store."""
+
+
+class SqliteActionStore(ActionStore):
+    """Single-host store. Serializes across threads and processes on one machine."""
 
     def __init__(self, root: Path, timeout: float = 10.0) -> None:
         self.root = Path(root)
@@ -237,22 +327,6 @@ class ActionStore:
         )
         return cursor.rowcount == 1
 
-    def claim_for_execution(self, proposal_id: str) -> bool:
-        """Claim a ready proposal for execution. Exactly one caller can succeed.
-
-        This is the double-spend guard. Everything about executing an action hangs
-        off winning this single conditional UPDATE.
-        """
-        return self.transition(proposal_id, [ProposalState.READY], ProposalState.EXECUTING)
-
-    def release_claim(self, proposal_id: str) -> bool:
-        """Return a claimed proposal to ready after a pre-execution failure.
-
-        Only used when the action provably did not run - a missing executor, a
-        policy re-check that denied. Never after an executor has been entered.
-        """
-        return self.transition(proposal_id, [ProposalState.EXECUTING], ProposalState.READY)
-
     # -- executions ------------------------------------------------------- #
 
     def save_execution(self, record: ExecutionRecord, amount: float = 0.0, affected: int = 0) -> ExecutionRecord:
@@ -370,3 +444,23 @@ class ActionStore:
             (str(ProposalState.EXECUTING), cutoff),
         )
         return [self._from_row(row) for row in rows]
+
+
+def open_store(root: Path, dsn: str | None = None) -> ActionStore:
+    """Open the right store for this deployment.
+
+    A DSN selects Postgres, which is what a multi-machine deployment needs: several
+    workers behind a load balancer share one consistency domain, so the execution
+    claim still admits exactly one winner. Without a DSN the store is SQLite, which
+    is correct and considerably simpler on a single host.
+
+    The DSN can come from the argument or from ``APERTURE_STORE_DSN``, so switching
+    a deployment from one to the other is an environment change rather than a code
+    change.
+    """
+    dsn = dsn or os.environ.get("APERTURE_STORE_DSN") or ""
+    if dsn:
+        from .postgres_store import PostgresActionStore
+
+        return PostgresActionStore(dsn)
+    return SqliteActionStore(root)

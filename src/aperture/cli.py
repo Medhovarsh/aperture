@@ -358,6 +358,68 @@ def cmd_actions(args: argparse.Namespace) -> int:
     raise ValueError(f"unknown action command: {action}")
 
 
+def cmd_policy(args: argparse.Namespace) -> int:
+    """Show or diff the effective access a policy grants."""
+    import yaml
+
+    from .policy import Policy
+    from .policy_diff import compute_access, diff_access
+
+    workspace = Workspace.load(args.workspace)
+    current = compute_access(
+        workspace.policy, workspace.principals, workspace.catalog, workspace.actions
+    )
+
+    if args.policy_command == "access":
+        if args.json:
+            _print_json(
+                [
+                    {
+                        "principal": g.principal_id,
+                        "purpose": g.purpose,
+                        "kind": g.kind,
+                        "target": g.target,
+                    }
+                    for g in sorted(current.grants, key=lambda g: g.describe())
+                ]
+            )
+            return 0
+        print(f"{len(current)} effective grant(s):")
+        for grant in sorted(current.grants, key=lambda g: g.describe()):
+            print(f"  {grant.describe()}")
+        return 0
+
+    # diff
+    other_path = Path(args.against)
+    if not other_path.is_file():
+        print(f"no such policy file: {other_path}", file=sys.stderr)
+        return 1
+    try:
+        other_policy = Policy.from_dict(yaml.safe_load(other_path.read_text(encoding="utf-8")) or {})
+    except Exception as exc:  # noqa: BLE001 - report, do not traceback at an operator
+        print(f"could not load {other_path}: {exc}", file=sys.stderr)
+        return 1
+
+    baseline = compute_access(
+        other_policy, workspace.principals, workspace.catalog, workspace.actions
+    )
+    # The file passed in is the "before"; the workspace is the proposed "after".
+    difference = diff_access(baseline, current)
+    print(difference.render())
+
+    if difference.widened and not args.allow_widening:
+        print(
+            f"\nRefusing: this change grants {len(difference.widened)} new access path(s).",
+            file=sys.stderr,
+        )
+        print(
+            "Re-run with --allow-widening if the widening is intended and reviewed.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the MCP server over stdio."""
     from .mcp_server import serve_stdio
@@ -506,6 +568,27 @@ def build_parser() -> argparse.ArgumentParser:
         "stuck", help="proposals stranded mid-execution, for a human to resolve"
     )
     act_stuck.add_argument("--older-than", type=int, default=300, metavar="SECONDS")
+
+    policy = subparsers.add_parser(
+        "policy", help="inspect what the policy actually grants"
+    )
+    add_workspace(policy)
+    policy_subparsers = policy.add_subparsers(dest="policy_command", required=True)
+    policy.set_defaults(func=cmd_policy)
+
+    pol_access = policy_subparsers.add_parser(
+        "access", help="every principal, purpose, and thing they can reach"
+    )
+    pol_access.add_argument("--json", action="store_true")
+
+    pol_diff = policy_subparsers.add_parser(
+        "diff",
+        help="compare effective access against another policy file; exits 1 on widening",
+    )
+    pol_diff.add_argument("--against", required=True, metavar="POLICY_YAML",
+                          help="the previous policy to compare against")
+    pol_diff.add_argument("--allow-widening", action="store_true",
+                          help="permit new access paths (use when the widening is intended)")
 
     serve = subparsers.add_parser("serve", help="run the MCP server over stdio")
     add_workspace(serve)

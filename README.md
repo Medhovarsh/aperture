@@ -373,6 +373,60 @@ policy matching what the page actually loads, and two probes that answer differe
 questions — `/healthz` says the process is up, `/readyz` says a governed request can
 actually be served and the audit chain still verifies.
 
+### Proving a policy change does not widen access
+
+A YAML diff tells you which lines moved. It does not tell you whether the support
+team can now read the employee directory. Those are different questions, and
+reading the first to answer the second is how permissions quietly widen.
+
+`aperture policy diff` computes the **effective** access matrix — every principal,
+every purpose, every source and action they can reach — for two policies, and
+reports the difference:
+
+```bash
+aperture policy diff -w workspace --against policy-before.yaml
+```
+
+```
+WIDENED (2) - access that did not exist before:
+  + svc_support_agent / hr_support -> source people_db
+  + u_kim / hr_support -> source people_db
+
+Refusing: this change grants 2 new access path(s).
+```
+
+It exits non-zero, so a pull request that broadens access fails CI unless someone
+passes `--allow-widening` deliberately. A forty-line rule refactor that grants
+nothing new reports **no change** — the tool is indifferent to how policy is
+written and interested only in what it permits.
+
+Widenings and narrowings are never netted off against each other. A change that
+removes one grant and adds another is not "no change"; the added one still needs
+review.
+
+```bash
+aperture policy access -w workspace     # the full matrix, as configuration
+```
+
+### Multi-host deployments
+
+SQLite makes execution atomic across threads and processes on one machine. The day
+there are two machines, that stops being true silently — two workers with two
+SQLite files both believe they won the claim.
+
+Point every worker at one Postgres and the guarantee holds across the fleet:
+
+```bash
+pip install "aperture-plane[postgres]"
+export APERTURE_STORE_DSN=postgresql://user:pass@db.internal:5432/aperture
+```
+
+Nothing above the store changes. Both backends implement one interface and are
+verified by **the same conformance suite**, including a test that races eight
+independent database connections at a single approval and asserts exactly one
+wins. CI runs it against a real Postgres service container, because a backend
+that is only ever skipped is a backend that does not work.
+
 ### Identity from your existing IdP
 
 A static principals file suits one process serving one identity. When a gateway
@@ -671,9 +725,12 @@ and nothing an attacker can write into an index participates in that decision.
 
 ### What is *not* claimed
 
-- **Single host, not distributed.** SQLite in WAL mode makes execution atomic across
-  threads and processes on one machine. Several machines sharing one workspace need
-  Postgres behind the same `ActionStore` interface; that has not been built.
+- **Postgres is verified in CI, not in production.** The backend passes the same
+  conformance suite as SQLite against a real database, including a concurrent claim
+  race across eight connections. Nobody has run it under sustained production load.
+- **The workspace files are still local.** The store can be shared; catalog, policy,
+  and principals are read from disk on each host, so a fleet needs them distributed
+  by whatever already ships your configuration.
 - **Executors are demo implementations.** They operate on a local SQLite database.
   The `Executor` interface is the seam for Stripe or Zendesk, and the exception
   boundary already treats executors as untrusted, but no real integration ships.
@@ -697,7 +754,7 @@ pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-249 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
+280 tests (plus 19 Postgres tests in CI), run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
 
 - **`tests/test_conformance.py`** — a policy conformance matrix asserting, for every
   (principal, purpose) pair, exactly which sources are readable. Read it as the

@@ -24,7 +24,7 @@ import yaml
 
 from .actions.catalog import ActionCatalog
 from .actions.gateway import ActionGateway
-from .actions.store import ActionStore
+from .actions.store import ActionStore, open_store
 from .catalog import Catalog
 from .identity import PrincipalRegistry
 from .lineage import LineageLog
@@ -136,8 +136,13 @@ class Workspace:
 
     @property
     def action_store(self) -> ActionStore:
-        """Durable proposal and execution state."""
-        return ActionStore(self.root / STATE_DIR)
+        """Durable proposal and execution state.
+
+        SQLite by default. Setting APERTURE_STORE_DSN switches the deployment to
+        Postgres, which is what a fleet of workers needs: the execution claim only
+        admits one winner if every worker shares one consistency domain.
+        """
+        return open_store(self.root / STATE_DIR)
 
     def gateway(self) -> ActionGateway:
         """Build the action gateway for this workspace."""
