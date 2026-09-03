@@ -16,12 +16,14 @@ Two invariants hold on every path through :meth:`ContextPlane.search`:
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from datetime import datetime
 
 from .brokers import Broker, BrokerError, build_brokers
 from .enforcement import Enforcer
 from .lineage import new_trace_id
+from .observability import record_search
 from .reasons import Reason, explain
 from .router import RoutedSource, SemanticRouter
 from .types import (
@@ -82,6 +84,7 @@ class ContextPlane:
         now: datetime | None = None,
     ) -> SearchResponse:
         """Answer a governed retrieval request."""
+        started = time.perf_counter()
         trace_id = new_trace_id()
         principal = self.workspace.principals.get(principal_id)
 
@@ -158,6 +161,12 @@ class ContextPlane:
             purpose=request.purpose,
         )
         self._log(trace_id, principal_id, principal, request, response, list(routed_by_id.values()))
+        record_search(
+            purpose=request.purpose,
+            returned=len(response.records),
+            withheld=response.withheld,
+            duration=time.perf_counter() - started,
+        )
         return response
 
     def fetch(

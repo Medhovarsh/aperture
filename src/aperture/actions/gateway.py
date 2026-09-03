@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..lineage import LineageLog
+from ..observability import record_action
 from ..policy import Policy
 from ..reasons import Reason, explain
 from ..types import Principal
@@ -429,6 +430,14 @@ class ActionGateway:
                 update={"state": ProposalState.EXECUTED, "execution_id": record.id}
             )
         )
+        record_action(
+            "action.executed",
+            action_id=spec.id,
+            outcome="executed",
+            amount=proposal.blast.amount,
+            proposal_id=proposal.id,
+            reversible=compensation is not None,
+        )
         self._log(
             "action_executed",
             principal_id=principal.id,
@@ -564,6 +573,12 @@ class ActionGateway:
         detail: str = "",
     ) -> ActionRefusal:
         """Build a refusal and record the attempt."""
+        record_action(
+            "action.refused",
+            action_id=action_id or "unknown",
+            outcome=str(reason),
+            proposal_id=proposal_id,
+        )
         self._log(
             "action_refused",
             principal_id=principal_id,

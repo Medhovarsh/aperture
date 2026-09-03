@@ -31,3 +31,16 @@ def workspace(workspace_root: Path) -> Workspace:
 def plane(workspace: Workspace) -> ContextPlane:
     """A context plane over the demo workspace."""
     return ContextPlane(workspace)
+
+
+@pytest.fixture()
+def client(tmp_path: Path):
+    """A playground client with its own session pool and a frozen rate-limit clock."""
+    fastapi = pytest.importorskip("fastapi", reason="playground needs the [web] extra")
+    from fastapi.testclient import TestClient
+
+    from aperture import playground
+
+    playground.sessions = playground.SessionPool(tmp_path / "sessions")
+    playground.limiter = playground.RateLimiter(clock=lambda: 1000.0)
+    return TestClient(playground.app)

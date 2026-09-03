@@ -376,6 +376,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         default_purpose=args.purpose,
         allow_principal_override=args.allow_principal_override,
         signing_secret=secret,
+        jwks_url=args.jwks_url,
+        issuer=args.issuer,
+        audience=args.audience,
     )
     return 0
 
@@ -525,6 +528,12 @@ def build_parser() -> argparse.ArgumentParser:
             "every tool call must carry a signed caller assertion"
         ),
     )
+    serve.add_argument(
+        "--jwks-url", default=None,
+        help="verify RS256 tokens from an identity provider's JWKS endpoint",
+    )
+    serve.add_argument("--issuer", default=None, help="expected token issuer")
+    serve.add_argument("--audience", default=None, help="expected token audience")
     serve.set_defaults(func=cmd_serve)
 
     assertion = subparsers.add_parser(

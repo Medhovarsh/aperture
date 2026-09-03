@@ -278,3 +278,11 @@ EXECUTOR_CLASSES: dict[str, type[Executor]] = {
 def build_executors(workspace_root: Path) -> dict[str, Executor]:
     """Instantiate every known executor for a workspace."""
     return {name: cls(workspace_root) for name, cls in EXECUTOR_CLASSES.items()}
+
+
+# Imported last, and registered here rather than above, because http_executor needs
+# Executor and ExecutorError from this module. By this point they exist, so the
+# partially-initialized module it imports back is complete enough.
+from .http_executor import HttpExecutor  # noqa: E402
+
+EXECUTOR_CLASSES[HttpExecutor.name] = HttpExecutor

@@ -45,6 +45,7 @@ from . import __version__
 from .actions.gateway import ActionGateway
 from .actions.types import ActionRefusal, Proposal
 from .demo import build_demo_workspace
+from .observability import configure_logging, metrics
 from .plane import ContextPlane
 from .types import SearchRequest
 from .workspace import Workspace
@@ -267,6 +268,21 @@ async def session_and_limits(request: Request, call_next):
     for header, value in SECURITY_HEADERS.items():
         response.headers[header] = value
     return response
+
+
+configure_logging()
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def prometheus_metrics() -> str:
+    """Prometheus exposition endpoint.
+
+    Deliberately label-free on anything a visitor controls. An attacker who can
+    invent label values can grow a metrics store's cardinality until it falls over,
+    so labels come only from purposes, action ids, and reason codes - all values the
+    deployment defines.
+    """
+    return metrics.render()
 
 
 @app.get("/healthz", response_class=PlainTextResponse)

@@ -1,0 +1,32 @@
+# Local Aperture stack.
+#
+#   docker compose up --build
+#   open http://localhost:8000
+#
+# The workspace is mounted, not baked in: policy, catalog, and principals are
+# operational configuration, and a policy fix should not require a rebuild.
+services:
+  aperture:
+    build: .
+    image: aperture:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./workspace:/workspace
+    environment:
+      # Anchor secret for lineage checkpoints. In a real deployment this comes from
+      # a secret manager and lives outside the host that writes the log - anchoring
+      # to a secret the log's writer can read proves nothing.
+      APERTURE_ANCHOR_SECRET: ${APERTURE_ANCHOR_SECRET:-change-me-at-least-16-chars}
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

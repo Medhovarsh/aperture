@@ -564,6 +564,9 @@ def serve_stdio(
     default_purpose: str | None = None,
     allow_principal_override: bool = False,
     signing_secret: str | None = None,
+    jwks_url: str | None = None,
+    issuer: str | None = None,
+    audience: str | None = None,
 ) -> None:
     """Load a workspace and serve it over stdio.
 
@@ -572,11 +575,20 @@ def serve_stdio(
     """
     workspace = Workspace.load(workspace_root)
     plane = ContextPlane(workspace)
-    verifier = (
-        AssertionVerifier(signing_secret, nonce_store=workspace.action_store)
-        if signing_secret
-        else None
-    )
+    # Three identity modes, chosen at launch and never by the caller: an
+    # enterprise IdP, a shared-secret assertion, or a server-pinned principal.
+    verifier: Any = None
+    if jwks_url:
+        from .jwks import JwksAssertionVerifier, JwksConfig
+
+        if not issuer or not audience:
+            raise SystemExit("--jwks-url requires --issuer and --audience")
+        verifier = JwksAssertionVerifier(
+            JwksConfig(jwks_url=jwks_url, issuer=issuer, audience=audience),
+            nonce_store=workspace.action_store,
+        )
+    elif signing_secret:
+        verifier = AssertionVerifier(signing_secret, nonce_store=workspace.action_store)
     if verifier is None and workspace.principals.get(principal_id) is None:
         raise SystemExit(
             f"principal '{principal_id}' is not registered in this workspace"

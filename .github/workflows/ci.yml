@@ -234,3 +234,67 @@ jobs:
             echo "a rewritten log still verified" && exit 1
           fi
           echo "rewrite detected"
+
+  container:
+    name: container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t aperture:ci .
+
+      - name: The image must run as a non-root user
+        run: |
+          set -euo pipefail
+          user=$(docker run --rm aperture:ci id -un)
+          echo "container user: $user"
+          test "$user" = "aperture" || { echo "image runs as $user"; exit 1; }
+
+      - name: Serve and answer both probes
+        run: |
+          set -euo pipefail
+          docker run -d --name aperture-ci -p 8000:8000 aperture:ci
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/healthz > /dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS http://localhost:8000/healthz
+          curl -fsS http://localhost:8000/readyz -o readyz.json
+          cat readyz.json
+          python - <<'PYCHECK'
+          import json
+          body = json.load(open("readyz.json"))
+          assert body["ready"] is True, body
+          assert body["lineage_chain_intact"] is True, body
+          print("container serves a governed request")
+          PYCHECK
+
+      - name: Metrics endpoint must expose Prometheus text
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST http://localhost:8000/api/search \
+            -H 'Content-Type: application/json' \
+            -d '{"principal_id":"u_kim","purpose":"customer_support","question":"refund window"}' \
+            -o /dev/null
+          curl -fsS http://localhost:8000/metrics | grep aperture_searches_total
+
+      - name: The MCP server must run in the same image
+        run: |
+          set -euo pipefail
+          docker run --rm aperture:ci sh -c 'aperture demo --path /tmp/ws >/dev/null && echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}" | aperture serve -w /tmp/ws -p svc_support_agent --purpose customer_support' > tools.jsonl
+          python - <<'PYCHECK'
+          import json
+          reply = json.loads(open("tools.jsonl").readline())
+          names = {tool["name"] for tool in reply["result"]["tools"]}
+          assert "context_search" in names and "action_propose" in names, names
+          print("MCP tools available in the container:", len(names))
+          PYCHECK
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker logs aperture-ci || true
+
+      - name: Stop
+        if: always()
+        run: docker rm -f aperture-ci || true

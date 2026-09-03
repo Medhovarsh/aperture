@@ -193,3 +193,58 @@ def test_concurrent_actions_keep_the_audit_chain_intact(
 
     ok, problems = workspace.lineage.verify()
     assert ok, problems
+
+
+# --------------------------------------------------------------------------- #
+# multiple processes
+# --------------------------------------------------------------------------- #
+
+
+def test_separate_processes_cannot_double_execute(workspace: Workspace, tmp_path: Path) -> None:
+    """Threads share a lock; processes do not.
+
+    A real deployment runs several workers, often several processes behind one
+    socket. The claim has to hold across process boundaries too, which it does
+    because it is a conditional UPDATE that SQLite serializes - not an in-process
+    lock. This spawns real interpreters to prove it.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    gateway = workspace.gateway()
+    proposal = gateway.propose(
+        "svc_support_agent", "customer_support", "support.refund",
+        {"customer_id": "cus-4471", "amount": 40.0},
+    )
+    assert isinstance(proposal, Proposal)
+
+    script = textwrap.dedent(
+        """
+        import sys
+        sys.path.insert(0, sys.argv[1])
+        from aperture.workspace import Workspace
+        from aperture.actions.types import ExecutionRecord
+
+        gateway = Workspace.load(sys.argv[2]).gateway()
+        result = gateway.execute(sys.argv[3], "svc_support_agent")
+        print("EXECUTED" if isinstance(result, ExecutionRecord) else str(result.reason))
+        """
+    )
+    script_path = tmp_path / "race_worker.py"
+    script_path.write_text(script, encoding="utf-8")
+    src_root = str(Path(__file__).resolve().parent.parent / "src")
+
+    processes = [
+        subprocess.Popen(
+            [sys.executable, str(script_path), src_root, str(workspace.root), proposal.id],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for _ in range(4)
+    ]
+    outputs = [process.communicate()[0].strip() for process in processes]
+
+    assert outputs.count("EXECUTED") == 1, outputs
+    assert ops_rows(workspace, "SELECT amount FROM refunds") == [(40.0,)]
