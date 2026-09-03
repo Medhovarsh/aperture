@@ -100,3 +100,122 @@ def test_lineage_records_denials_too(client: TestClient) -> None:
     entries = client.get("/api/lineage").json()["entries"]
     assert entries[-1]["returned"] == 0
     assert entries[-1]["withheld"]
+
+
+# --------------------------------------------------------------------------- #
+# actions
+# --------------------------------------------------------------------------- #
+
+
+def propose(client: TestClient, **kwargs) -> dict:
+    payload = {
+        "principal_id": "svc_support_agent",
+        "purpose": "customer_support",
+        "action_id": "support.refund",
+        "arguments": {"customer_id": "cus-4471", "amount": 3000},
+    }
+    payload.update(kwargs)
+    response = client.post("/api/actions/propose", json=payload)
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_action_listing_follows_the_selected_identity(client: TestClient) -> None:
+    support = client.get(
+        "/api/actions",
+        params={"principal_id": "svc_support_agent", "purpose": "customer_support"},
+    ).json()["actions"]
+    assert {a["id"] for a in support} == {
+        "support.refund", "support.close_ticket", "support.message_customer"
+    }
+
+    partner = client.get(
+        "/api/actions", params={"principal_id": "u_partner", "purpose": "customer_support"}
+    ).json()["actions"]
+    assert partner == []
+
+
+def test_propose_returns_a_measured_blast_radius(client: TestClient) -> None:
+    data = propose(client)
+    assert data["refused"] is False
+    assert data["state"] == "pending_approval"
+    assert data["blast"]["amount"] == 3000
+    assert data["blast"]["reversible"] is True
+
+
+def test_over_limit_proposal_is_refused_with_a_reason(client: TestClient) -> None:
+    data = propose(client, arguments={"customer_id": "cus-4471", "amount": 9000})
+    assert data["refused"] is True
+    assert data["reason"] == "impact_limit_exceeded"
+
+
+def test_purge_shows_the_gap_between_argument_and_consequence(client: TestClient) -> None:
+    data = propose(
+        client,
+        principal_id="u_ops",
+        purpose="data_retention",
+        action_id="ops.purge_region",
+        arguments={"region": "legacy"},
+    )
+    assert data["refused"] is True
+    assert "7 record(s)" in data["detail"]
+
+
+def test_full_approve_execute_rollback_loop(client: TestClient) -> None:
+    proposal = propose(client)
+
+    decided = client.post(
+        "/api/actions/decide",
+        json={"proposal_id": proposal["proposal_id"], "approver_id": "u_kim", "approved": True},
+    ).json()
+    assert decided["state"] == "ready"
+    assert decided["approval"]["decided_by"] == "u_kim"
+
+    executed = client.post(
+        "/api/actions/execute",
+        json={
+            "proposal_id": proposal["proposal_id"],
+            "principal_id": "svc_support_agent",
+        },
+    ).json()
+    assert executed["executed"] is True
+    assert executed["reversible"] is True
+
+    state = client.get("/api/state").json()
+    assert [row["status"] for row in state["refunds"]] == ["issued"]
+
+    rolled = client.post(
+        "/api/actions/rollback",
+        json={"execution_id": executed["execution_id"], "principal_id": "u_kim"},
+    ).json()
+    assert rolled["rolled_back"] is True
+    assert client.get("/api/state").json()["refunds"][0]["status"] == "reversed"
+
+
+def test_self_approval_is_refused_through_http(client: TestClient) -> None:
+    proposal = propose(client)
+    decided = client.post(
+        "/api/actions/decide",
+        json={
+            "proposal_id": proposal["proposal_id"],
+            "approver_id": "svc_support_agent",
+            "approved": True,
+        },
+    ).json()
+    assert decided["refused"] is True
+    assert decided["reason"] == "self_approval_forbidden"
+
+
+def test_lineage_covers_reads_and_actions_in_one_chain(client: TestClient) -> None:
+    ask(client, "u_kim", "customer_support", "refund window")
+    propose(client)
+    data = client.get("/api/lineage").json()
+    kinds = {entry["kind"] for entry in data["entries"]}
+    assert {"search", "action_proposed"} <= kinds
+    assert data["chain_intact"] is True
+
+
+def test_operations_state_is_exposed_so_effects_are_visible(client: TestClient) -> None:
+    state = client.get("/api/state").json()
+    assert {"customers", "tickets", "refunds", "messages"} == set(state)
+    assert any(row["region"] == "legacy" for row in state["customers"])

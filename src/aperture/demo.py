@@ -535,7 +535,7 @@ def build_demo_workspace(root: Path) -> Path:
             manager TEXT,
             location TEXT,
             salary TEXT,
-            national_id TEXT,
+            national_id TEXT,  -- synthetic placeholders; never SSN-shaped
             tenant TEXT,
             acl TEXT,
             updated_at TEXT
@@ -544,13 +544,13 @@ def build_demo_workspace(root: Path) -> Path:
     )
     rows = [
         ("e-1001", "Dana Whitfield", "People Ops Lead", "Ana Duarte", "Austin",
-         "184000", "532-88-4410", "acme", "hr,employees", recent.isoformat()),
+         "184000", "SYNTHETIC-ID-0001", "acme", "hr,employees", recent.isoformat()),
         ("e-1002", "Raj Mehta", "Staff Platform Engineer", "Ana Duarte", "Bengaluru",
-         "212000", "641-22-9087", "acme", "hr,employees", recent.isoformat()),
+         "212000", "SYNTHETIC-ID-0002", "acme", "hr,employees", recent.isoformat()),
         ("e-1003", "Kim Alvarez", "Support Lead", "Dana Whitfield", "Lisbon",
-         "141000", "778-31-2245", "acme", "hr,employees", recent.isoformat()),
+         "141000", "SYNTHETIC-ID-0003", "acme", "hr,employees", recent.isoformat()),
         ("e-2001", "Priya Nandakumar", "Partner Architect", "Globex Mgmt", "Mumbai",
-         "0", "000-00-0000", "globex", "partners", recent.isoformat()),
+         "0", "SYNTHETIC-ID-0004", "globex", "partners", recent.isoformat()),
     ]
     connection.executemany(
         "INSERT INTO employees VALUES (?,?,?,?,?,?,?,?,?,?)", rows

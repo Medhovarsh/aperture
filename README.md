@@ -263,8 +263,17 @@ the workspace refuses to load.
 
 ## Try it in a browser
 
-A hosted playground ships in the repo: pick an identity, pick a purpose, ask a question,
-and watch records appear and disappear with their reason codes, plus the live audit trail.
+A hosted playground ships in the repo, covering both halves of the plane.
+
+**Reads:** pick an identity, pick a purpose, ask a question, and watch records appear and
+disappear with their reason codes.
+
+**Actions:** propose a refund and see the blast radius priced before anything happens.
+Under 100 USD it runs; at 3,000 it waits for a named human; at 9,000 it is refused.
+Approve it, execute it, undo it, and watch the operations tables change underneath.
+Try purging region `legacy` as the platform lead: one short argument, seven accounts.
+
+Both share one audit trail, and the chain integrity check is on the page.
 
 ```bash
 pip install -e ".[web]"
@@ -279,10 +288,11 @@ npm i -g vercel && vercel deploy
 
 `vercel.json` and `api/index.py` are already wired; the whole app is one function.
 
-The playground deliberately does the one thing the real server refuses to do - it lets
-**you** choose which principal to act as. That is the point of a demo, and it is exactly
-why the MCP server pins identity server-side: anything a caller can choose, a prompt
-injection can choose too. All playground data is synthetic, and on a serverless host the
+The playground deliberately does the two things the real deployment refuses to do: it
+lets **you** choose which principal to act as, and it exposes approval over HTTP. That
+is the point of a demo, and it is exactly why the MCP server does neither - identity is
+pinned server-side and there is no approval tool at all, because anything a caller can
+choose, a prompt injection can choose too. All playground data is synthetic, and on a serverless host the
 audit log lives only for the life of the instance.
 
 **The identity is on the server, not in the tool call.** One server instance acts as
@@ -466,7 +476,7 @@ pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-151 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
+159 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
 
 - **`tests/test_conformance.py`** — a policy conformance matrix asserting, for every
   (principal, purpose) pair, exactly which sources are readable. Read it as the

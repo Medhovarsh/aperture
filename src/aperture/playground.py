@@ -25,6 +25,8 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from .actions.gateway import ActionGateway
+from .actions.types import ActionRefusal, ExecutionRecord, Proposal
 from .demo import build_demo_workspace
 from .plane import ContextPlane
 from .types import SearchRequest
@@ -43,6 +45,49 @@ def get_plane() -> ContextPlane:
         build_demo_workspace(root)
         _plane = ContextPlane(Workspace.load(root))
     return _plane
+
+
+def get_gateway() -> ActionGateway:
+    """Return the action gateway over the same workspace."""
+    return get_plane().workspace.gateway()
+
+
+def _render_proposal(result: Proposal | ActionRefusal) -> dict[str, Any]:
+    """Shape a proposal or refusal for the UI."""
+    if isinstance(result, ActionRefusal):
+        return {
+            "refused": True,
+            "reason": str(result.reason),
+            "explanation": result.explanation,
+            "detail": result.detail,
+        }
+    return {
+        "refused": False,
+        "proposal_id": result.id,
+        "state": str(result.state),
+        "action_id": result.action_id,
+        "arguments": result.arguments,
+        "matched_rules": list(result.matched_rules),
+        "requires_approval": result.requires_approval,
+        "blast": {
+            "headline": result.blast.headline(),
+            "summary": result.blast.summary,
+            "affected": result.blast.affected,
+            "amount": result.blast.amount,
+            "reversible": result.blast.reversible,
+            "external_recipients": list(result.blast.external_recipients),
+        },
+        "approval": (
+            {
+                "approved": result.approval.approved,
+                "decided_by": result.approval.decided_by,
+                "note": result.approval.note,
+            }
+            if result.approval
+            else None
+        ),
+        "execution_id": result.execution_id,
+    }
 
 
 class PlaygroundQuery(BaseModel):
@@ -144,10 +189,23 @@ def lineage(limit: int = 8) -> dict[str, Any]:
         "entries": [
             {
                 "seq": entry.get("seq"),
+                "kind": entry.get("kind", "search"),
                 "trace_id": entry.get("trace_id"),
                 "principal_id": entry.get("principal_id"),
                 "purpose": entry.get("purpose"),
-                "question": entry.get("question"),
+                # Reads log a question; actions log what was attempted and to what.
+                "detail": (
+                    entry.get("question")
+                    or " ".join(
+                        part
+                        for part in (
+                            entry.get("action_id"),
+                            entry.get("reason"),
+                            entry.get("detail"),
+                        )
+                        if part
+                    )
+                ),
                 "returned": len(entry.get("returned", [])),
                 "withheld": entry.get("withheld", []),
                 "hash": str(entry.get("hash", ""))[:12],
@@ -155,6 +213,121 @@ def lineage(limit: int = 8) -> dict[str, Any]:
             for entry in log.tail(min(limit, 25))
         ],
     }
+
+
+# --------------------------------------------------------------------------- #
+# actions
+# --------------------------------------------------------------------------- #
+
+
+class ProposeRequest(BaseModel):
+    """A proposed action from the playground UI."""
+
+    principal_id: str
+    purpose: str
+    action_id: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class DecideRequest(BaseModel):
+    """A human decision made through the playground."""
+
+    proposal_id: str
+    approver_id: str
+    approved: bool = True
+    note: str = ""
+
+
+class ExecuteRequest(BaseModel):
+    """Execution or rollback of a cleared proposal."""
+
+    proposal_id: str = ""
+    execution_id: str = ""
+    principal_id: str
+
+
+@app.get("/api/actions")
+def list_actions(principal_id: str, purpose: str) -> dict[str, Any]:
+    """Actions this principal may take under this purpose."""
+    return {"actions": get_gateway().list_actions(principal_id, purpose)}
+
+
+@app.post("/api/actions/propose")
+def propose_action(request: ProposeRequest) -> JSONResponse:
+    """Price an action and return a proposal or a refusal with its reason."""
+    gateway = get_gateway()
+    result = gateway.propose(
+        request.principal_id, request.purpose, request.action_id, request.arguments
+    )
+    return JSONResponse(_render_proposal(result))
+
+
+@app.post("/api/actions/decide")
+def decide_action(request: DecideRequest) -> JSONResponse:
+    """Approve or reject a pending proposal.
+
+    Exposed here because the playground is a demo of the whole loop. In a real
+    deployment approval lives outside anything an agent can reach - the MCP server
+    has no approve tool at all.
+    """
+    result = get_gateway().decide(
+        request.proposal_id, request.approver_id, request.approved, request.note
+    )
+    return JSONResponse(_render_proposal(result))
+
+
+@app.post("/api/actions/execute")
+def execute_action(request: ExecuteRequest) -> JSONResponse:
+    """Run a cleared proposal."""
+    result = get_gateway().execute(request.proposal_id, request.principal_id)
+    if isinstance(result, ActionRefusal):
+        return JSONResponse(_render_proposal(result))
+    return JSONResponse(
+        {
+            "refused": False,
+            "executed": True,
+            "execution_id": result.id,
+            "action_id": result.action_id,
+            "result": result.result,
+            "reversible": result.reversible,
+        }
+    )
+
+
+@app.post("/api/actions/rollback")
+def rollback_action(request: ExecuteRequest) -> JSONResponse:
+    """Undo an execution that recorded a compensating operation."""
+    result = get_gateway().rollback(request.execution_id, request.principal_id)
+    if isinstance(result, ActionRefusal):
+        return JSONResponse(_render_proposal(result))
+    return JSONResponse(
+        {
+            "refused": False,
+            "rolled_back": True,
+            "execution_id": result.id,
+            "result": result.rollback_result,
+        }
+    )
+
+
+@app.get("/api/state")
+def operations_state() -> dict[str, Any]:
+    """Live contents of the systems actions operate on, so effects are visible."""
+    import sqlite3
+
+    plane = get_plane()
+    path = plane.workspace.root / "data" / "ops.db"
+    if not path.is_file():
+        return {"customers": [], "tickets": [], "refunds": [], "messages": []}
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        return {
+            table: [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
+            for table in ("customers", "tickets", "refunds", "messages")
+        }
+    finally:
+        connection.close()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -173,13 +346,13 @@ INDEX_HTML = """<!doctype html>
   :root {
     --bg: #f7f7f5; --panel: #ffffff; --ink: #1a1a1a; --muted: #6b6b6b;
     --line: #e3e3df; --accent: #2f5bd7; --allow: #0f7a4a; --deny: #b23a2f;
-    --chip: #f0f0ec; --code: #f4f4f1;
+    --warn: #a06000; --chip: #f0f0ec; --code: #f4f4f1;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #17171a; --panel: #1f1f23; --ink: #ececec; --muted: #9a9a9a;
       --line: #2e2e34; --accent: #7fa0ff; --allow: #4ecb8f; --deny: #ff8272;
-      --chip: #2a2a30; --code: #232329;
+      --warn: #e0a94a; --chip: #2a2a30; --code: #232329;
     }
   }
   * { box-sizing: border-box; }
@@ -192,30 +365,44 @@ INDEX_HTML = """<!doctype html>
   header p { margin: 0 0 4px; color: var(--muted); }
   header a { color: var(--accent); }
   .note {
-    margin: 18px 0 24px; padding: 10px 14px; border-left: 3px solid var(--accent);
+    margin: 18px 0 20px; padding: 10px 14px; border-left: 3px solid var(--accent);
     background: var(--panel); color: var(--muted); font-size: 13.5px; border-radius: 0 6px 6px 0;
   }
   .panel {
     background: var(--panel); border: 1px solid var(--line);
     border-radius: 10px; padding: 18px; margin-bottom: 18px;
   }
+  .tabs { display: flex; gap: 6px; margin-bottom: 18px; }
+  .tabs button {
+    margin: 0; padding: 9px 16px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--panel); color: var(--muted); font: inherit; font-weight: 600;
+    cursor: pointer;
+  }
+  .tabs button[aria-selected="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
   .row { display: flex; gap: 14px; flex-wrap: wrap; }
-  .field { flex: 1 1 220px; min-width: 200px; }
+  .field { flex: 1 1 220px; min-width: 190px; }
   label { display: block; font-size: 12px; text-transform: uppercase;
           letter-spacing: 0.06em; color: var(--muted); margin-bottom: 6px; }
   select, input[type=text] {
     width: 100%; padding: 9px 10px; border: 1px solid var(--line);
     border-radius: 7px; background: var(--bg); color: var(--ink); font: inherit;
   }
-  button {
+  button.primary {
     margin-top: 14px; padding: 10px 18px; border: 0; border-radius: 7px;
     background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
   }
-  button:disabled { opacity: 0.55; cursor: default; }
+  button.primary:disabled { opacity: 0.55; cursor: default; }
+  button.secondary {
+    margin-top: 10px; margin-right: 8px; padding: 8px 14px; border: 1px solid var(--line);
+    border-radius: 7px; background: var(--chip); color: var(--ink); font: inherit;
+    font-weight: 600; cursor: pointer;
+  }
+  button.danger { border-color: var(--deny); color: var(--deny); }
   .examples { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
   .examples button {
     margin: 0; padding: 5px 11px; font-size: 12.5px; font-weight: 500;
     background: var(--chip); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 7px; cursor: pointer;
   }
   .who { margin-top: 10px; font-size: 13px; color: var(--muted); }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.07em;
@@ -225,10 +412,15 @@ INDEX_HTML = """<!doctype html>
   .record h3 { margin: 0 0 4px; font-size: 15px; }
   .meta { font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
   .body { font-size: 14px; white-space: pre-wrap; }
-  .withheld { border: 1px solid var(--line); border-left: 3px solid var(--deny);
+  .withheld, .refused { border: 1px solid var(--line); border-left: 3px solid var(--deny);
               border-radius: 7px; padding: 10px 14px; margin-bottom: 8px; }
-  .withheld .code { color: var(--deny); font-weight: 600;
-                    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  .code { color: var(--deny); font-weight: 600;
+          font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  .blast { border: 1px solid var(--line); border-left: 3px solid var(--warn);
+           border-radius: 7px; padding: 12px 14px; margin-bottom: 10px; }
+  .blast.irreversible { border-left-color: var(--deny); }
+  .blast .headline { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                     font-size: 13.5px; }
   .tag { display: inline-block; background: var(--chip); border: 1px solid var(--line);
          border-radius: 20px; padding: 1px 9px; font-size: 12px; margin-right: 5px; }
   .summary { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -239,8 +431,10 @@ INDEX_HTML = """<!doctype html>
   th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
   .ok { color: var(--allow); font-weight: 600; }
+  .scroll { overflow-x: auto; }
   footer { margin-top: 28px; font-size: 13px; color: var(--muted); }
   footer a { color: var(--accent); }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
@@ -251,11 +445,9 @@ INDEX_HTML = """<!doctype html>
     <p><a href="https://github.com/Medhovarsh/aperture">github.com/Medhovarsh/aperture</a></p>
   </header>
 
-  <div class="note">
-    <strong>Try this:</strong> ask <em>&ldquo;how much parental leave do we offer&rdquo;</em> as
-    Dana under <code>hr_support</code>, then ask the same question as Kim under
-    <code>customer_support</code>. Same corpus, same question, different answer &mdash; and the
-    support agent is told what it could not see instead of quietly answering from a thinner context.
+  <div class="tabs" role="tablist">
+    <button id="tab-read" role="tab" aria-selected="true">Reads</button>
+    <button id="tab-act" role="tab" aria-selected="false">Actions</button>
   </div>
 
   <div class="panel">
@@ -269,26 +461,64 @@ INDEX_HTML = """<!doctype html>
         <label for="purpose">Declared purpose</label>
         <select id="purpose"></select>
       </div>
-      <div class="field" style="flex: 2 1 340px;">
+    </div>
+  </div>
+
+  <!-- READS ------------------------------------------------------------ -->
+  <section id="view-read">
+    <div class="note">
+      <strong>Try this:</strong> ask <em>&ldquo;how much parental leave do we offer&rdquo;</em> as
+      Dana under <code>hr_support</code>, then as Kim under <code>customer_support</code>.
+      Same corpus, same question, different answer &mdash; and the support agent is told what it
+      could not see instead of quietly answering from a thinner context.
+    </div>
+    <div class="panel">
+      <div class="field" style="min-width:100%">
         <label for="question">Question</label>
         <input type="text" id="question" value="how much parental leave do we offer">
       </div>
+      <div class="examples" id="examples"></div>
+      <button class="primary" id="ask">Ask the plane</button>
     </div>
-    <div class="examples" id="examples"></div>
-    <button id="ask">Ask the plane</button>
-  </div>
+    <div id="results"></div>
+  </section>
 
-  <div id="results"></div>
+  <!-- ACTIONS ---------------------------------------------------------- -->
+  <section id="view-act" hidden>
+    <div class="note">
+      <strong>Try this:</strong> as <em>Support Copilot</em> under <code>customer_support</code>,
+      refund 50 USD &mdash; it runs. Refund 3000 &mdash; it waits for a human. Refund 9000 &mdash;
+      it is refused. Then switch to <em>Ana Duarte</em> under <code>data_retention</code> and purge
+      region <code>legacy</code>: one short argument, seven deleted accounts, refused on impact.
+    </div>
+    <div class="panel">
+      <div class="row">
+        <div class="field">
+          <label for="action">Action</label>
+          <select id="action"></select>
+        </div>
+      </div>
+      <div id="action-desc" class="who"></div>
+      <div class="row" id="action-args" style="margin-top:14px"></div>
+      <button class="primary" id="propose">Propose action</button>
+    </div>
+    <div id="action-result"></div>
+    <div class="panel">
+      <h2>Systems these actions touch</h2>
+      <div class="scroll" id="ops-state">&mdash;</div>
+    </div>
+  </section>
 
   <div class="panel">
     <h2>Audit trail</h2>
-    <div id="lineage">&mdash;</div>
+    <div class="scroll" id="lineage">&mdash;</div>
   </div>
 
   <footer>
-    All data here is synthetic. This playground lets you choose an identity, which the real
-    MCP server refuses to do &mdash; identity is pinned server-side so a prompt injection cannot
-    change it. On a serverless host the audit log lives only for the life of the instance.
+    All data here is synthetic. This playground lets you choose an identity and approve
+    actions, which the real deployment refuses to do &mdash; the MCP server pins identity
+    server-side and exposes no approval tool, so nothing a prompt can influence reaches
+    either. On a serverless host the audit log lives only for the life of the instance.
   </footer>
 </div>
 
@@ -303,64 +533,82 @@ const EXAMPLES = [
 ];
 
 let identities = null;
+let actionSpecs = [];
+let lastProposal = null;
+let lastExecution = null;
 
-async function load() {
-  identities = await (await fetch("/api/identities")).json();
-
-  const principal = document.getElementById("principal");
-  principal.innerHTML = identities.principals
-    .map(p => `<option value="${p.id}">${p.display_name}</option>`).join("");
-
-  const purpose = document.getElementById("purpose");
-  purpose.innerHTML = identities.purposes
-    .map(p => `<option value="${p}">${p}</option>`).join("");
-
-  document.getElementById("examples").innerHTML = EXAMPLES
-    .map(q => `<button type="button" data-q="${q}">${q}</button>`).join("");
-  document.querySelectorAll("#examples button").forEach(button => {
-    button.onclick = () => {
-      document.getElementById("question").value = button.dataset.q;
-      ask();
-    };
-  });
-
-  principal.onchange = describe;
-  describe();
-  ask();
-}
-
-function describe() {
-  const id = document.getElementById("principal").value;
-  const who = identities.principals.find(p => p.id === id);
-  document.getElementById("who").innerHTML =
-    `tenant <span class="tag">${who.tenant}</span>` +
-    `clearance <span class="tag">${who.clearance}</span>` +
-    who.groups.map(g => `<span class="tag">${g}</span>`).join("");
-}
+function $(id) { return document.getElementById(id); }
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"]/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
+async function postJson(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  return response.json();
+}
+
+async function load() {
+  identities = await (await fetch("/api/identities")).json();
+
+  $("principal").innerHTML = identities.principals
+    .map(p => `<option value="${p.id}">${escapeHtml(p.display_name)}</option>`).join("");
+  $("purpose").innerHTML = identities.purposes
+    .map(p => `<option value="${p}">${p}</option>`).join("");
+
+  $("examples").innerHTML = EXAMPLES
+    .map(q => `<button type="button" data-q="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join("");
+  document.querySelectorAll("#examples button").forEach(button => {
+    button.onclick = () => { $("question").value = button.dataset.q; ask(); };
+  });
+
+  $("principal").onchange = () => { describe(); refreshActions(); };
+  $("purpose").onchange = refreshActions;
+  $("action").onchange = renderArguments;
+  $("ask").onclick = ask;
+  $("propose").onclick = propose;
+  $("tab-read").onclick = () => showTab("read");
+  $("tab-act").onclick = () => showTab("act");
+
+  describe();
+  await ask();
+  await refreshActions();
+}
+
+function showTab(which) {
+  $("tab-read").setAttribute("aria-selected", String(which === "read"));
+  $("tab-act").setAttribute("aria-selected", String(which === "act"));
+  $("view-read").hidden = which !== "read";
+  $("view-act").hidden = which !== "act";
+  if (which === "act") { refreshActions(); renderOpsState(); }
+}
+
+function describe() {
+  const who = identities.principals.find(p => p.id === $("principal").value);
+  $("who").innerHTML =
+    `tenant <span class="tag">${escapeHtml(who.tenant)}</span>` +
+    `clearance <span class="tag">${escapeHtml(who.clearance)}</span>` +
+    who.groups.map(g => `<span class="tag">${escapeHtml(g)}</span>`).join("");
+}
+
+/* ---------------- reads ---------------- */
+
 async function ask() {
-  const button = document.getElementById("ask");
+  const button = $("ask");
   button.disabled = true;
   button.textContent = "Asking...";
-
-  const payload = {
-    principal_id: document.getElementById("principal").value,
-    purpose: document.getElementById("purpose").value,
-    question: document.getElementById("question").value
-  };
-
   try {
-    const data = await (await fetch("/api/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    })).json();
-    render(data);
+    const data = await postJson("/api/search", {
+      principal_id: $("principal").value,
+      purpose: $("purpose").value,
+      question: $("question").value
+    });
+    renderSearch(data);
     await renderLineage();
   } finally {
     button.disabled = false;
@@ -368,7 +616,7 @@ async function ask() {
   }
 }
 
-function render(data) {
+function renderSearch(data) {
   const records = data.records.map(r => `
     <div class="record">
       <h3>${escapeHtml(r.title)}</h3>
@@ -376,7 +624,7 @@ function render(data) {
         source <strong>${escapeHtml(r.source_id)}</strong> &middot;
         ${escapeHtml(r.sensitivity)} &middot; owner ${escapeHtml(r.owner)} &middot;
         score ${r.score}${r.age_days !== null ? " &middot; " + r.age_days + "d old" : ""}
-        ${r.redacted_fields.length ? ' &middot; <strong>redacted: ' +
+        ${r.redacted_fields.length ? " &middot; <strong>redacted: " +
           escapeHtml(r.redacted_fields.join(", ")) + "</strong>" : ""}
       </div>
       <div class="body">${escapeHtml(r.text)}</div>
@@ -390,7 +638,7 @@ function render(data) {
         w.sources.length ? " &mdash; " + escapeHtml(w.sources.join(", ")) : ""}</div>
     </div>`).join("") || '<p class="meta">Nothing withheld.</p>';
 
-  document.getElementById("results").innerHTML = `
+  $("results").innerHTML = `
     <div class="panel">
       <div class="summary">${escapeHtml(data.summary)}
         <br>trace ${escapeHtml(data.trace_id)}
@@ -402,26 +650,240 @@ function render(data) {
     </div>`;
 }
 
+/* ---------------- actions ---------------- */
+
+async function refreshActions() {
+  const params = new URLSearchParams({
+    principal_id: $("principal").value,
+    purpose: $("purpose").value
+  });
+  const data = await (await fetch("/api/actions?" + params)).json();
+  actionSpecs = data.actions;
+
+  if (!actionSpecs.length) {
+    $("action").innerHTML = "<option value=''>(no actions available)</option>";
+    $("action-desc").textContent =
+      "This identity may take no actions under this purpose.";
+    $("action-args").innerHTML = "";
+    $("propose").disabled = true;
+    return;
+  }
+  $("propose").disabled = false;
+  $("action").innerHTML = actionSpecs
+    .map(a => `<option value="${a.id}">${escapeHtml(a.id)}</option>`).join("");
+  renderArguments();
+}
+
+function currentSpec() {
+  return actionSpecs.find(a => a.id === $("action").value);
+}
+
+function renderArguments() {
+  const spec = currentSpec();
+  if (!spec) return;
+  $("action-desc").innerHTML =
+    escapeHtml(spec.description) +
+    `<br><span class="tag">${spec.effect_class}</span>` +
+    `<span class="tag">${spec.reversible ? "reversible" : "IRREVERSIBLE"}</span>` +
+    (spec.requires_approval ? '<span class="tag">needs approval</span>' : "");
+
+  const defaults = {
+    customer_id: "cus-4471", amount: "3000", ticket_id: "tkt-1180",
+    region: "legacy", to: "ops@rivera.example", subject: "About your refund",
+    body: "Your refund has been issued."
+  };
+  $("action-args").innerHTML = Object.entries(spec.parameters).map(([name, meta]) => `
+    <div class="field">
+      <label for="arg-${name}">${escapeHtml(name)} (${meta.type})</label>
+      <input type="text" id="arg-${name}" data-type="${meta.type}"
+             value="${escapeHtml(defaults[name] || "")}">
+    </div>`).join("");
+}
+
+function collectArguments() {
+  const spec = currentSpec();
+  const args = {};
+  Object.entries(spec.parameters).forEach(([name, meta]) => {
+    const raw = $("arg-" + name).value;
+    if (meta.type === "number") args[name] = parseFloat(raw);
+    else if (meta.type === "integer") args[name] = parseInt(raw, 10);
+    else if (meta.type === "boolean") args[name] = ["1", "true", "yes"].includes(raw.toLowerCase());
+    else args[name] = raw;
+  });
+  return args;
+}
+
+async function propose() {
+  const button = $("propose");
+  button.disabled = true;
+  button.textContent = "Pricing...";
+  try {
+    const data = await postJson("/api/actions/propose", {
+      principal_id: $("principal").value,
+      purpose: $("purpose").value,
+      action_id: $("action").value,
+      arguments: collectArguments()
+    });
+    lastProposal = data.refused ? null : data;
+    lastExecution = null;
+    renderAction(data);
+    await renderLineage();
+    await renderOpsState();
+  } finally {
+    button.disabled = false;
+    button.textContent = "Propose action";
+  }
+}
+
+function renderAction(data, extra) {
+  if (data.refused) {
+    $("action-result").innerHTML = `
+      <div class="panel">
+        <div class="refused">
+          <span class="code">${escapeHtml(data.reason)}</span>
+          <div class="meta">${escapeHtml(data.explanation)}</div>
+          ${data.detail ? `<div class="meta mono">${escapeHtml(data.detail)}</div>` : ""}
+        </div>
+        <p class="meta">Nothing happened. The refusal carries a reason code the agent
+        is required to relay.</p>
+      </div>`;
+    return;
+  }
+
+  const blast = data.blast;
+  const approvers = identities.principals
+    .filter(p => p.id !== data.arguments_principal && p.id !== $("principal").value)
+    .map(p => `<option value="${p.id}">${escapeHtml(p.display_name)}</option>`).join("");
+
+  let controls = "";
+  if (data.state === "pending_approval") {
+    controls = `
+      <h2 style="margin-top:16px">Waiting on a human</h2>
+      <div class="row">
+        <div class="field">
+          <label for="approver">Approve as</label>
+          <select id="approver">${approvers}</select>
+        </div>
+      </div>
+      <button class="secondary" id="approve">Approve</button>
+      <button class="secondary danger" id="deny">Reject</button>
+      <p class="meta">The proposer cannot approve its own action, and the approver must
+      belong to a group the action names.</p>`;
+  } else if (data.state === "ready") {
+    controls = `<button class="secondary" id="execute">Execute</button>`;
+  } else if (data.state === "executed") {
+    controls = `<p class="meta">Executed.</p>`;
+  }
+
+  $("action-result").innerHTML = `
+    <div class="panel">
+      <div class="summary">proposal ${escapeHtml(data.proposal_id)} &middot;
+        state <strong>${escapeHtml(data.state)}</strong> &middot;
+        rules: ${escapeHtml(data.matched_rules.join(", ") || "(none)")}</div>
+      <h2>Blast radius &mdash; measured, not asserted</h2>
+      <div class="blast ${blast.reversible ? "" : "irreversible"}">
+        <div class="headline">${escapeHtml(blast.headline)}</div>
+      </div>
+      ${data.approval ? `<p class="meta">${data.approval.approved ? "approved" : "rejected"}
+        by ${escapeHtml(data.approval.decided_by)}
+        ${data.approval.note ? "&mdash; " + escapeHtml(data.approval.note) : ""}</p>` : ""}
+      ${extra || ""}
+      ${controls}
+    </div>`;
+
+  if ($("approve")) $("approve").onclick = () => decide(true);
+  if ($("deny")) $("deny").onclick = () => decide(false);
+  if ($("execute")) $("execute").onclick = execute;
+  if ($("rollback")) $("rollback").onclick = rollback;
+}
+
+async function decide(approved) {
+  const data = await postJson("/api/actions/decide", {
+    proposal_id: lastProposal.proposal_id,
+    approver_id: $("approver").value,
+    approved: approved,
+    note: approved ? "reviewed in the playground" : "rejected in the playground"
+  });
+  if (!data.refused) lastProposal = data;
+  renderAction(data);
+  await renderLineage();
+}
+
+async function execute() {
+  const data = await postJson("/api/actions/execute", {
+    proposal_id: lastProposal.proposal_id,
+    principal_id: $("principal").value
+  });
+  if (data.refused) { renderAction(data); await renderLineage(); return; }
+  lastExecution = data;
+  renderAction(
+    Object.assign({}, lastProposal, { state: "executed" }),
+    `<h2 style="margin-top:16px">Result</h2>
+     <div class="record"><div class="mono">${escapeHtml(JSON.stringify(data.result))}</div></div>
+     ${data.reversible
+        ? '<button class="secondary" id="rollback">Undo it</button>'
+        : '<p class="meta">This action cannot be undone.</p>'}`
+  );
+  await renderLineage();
+  await renderOpsState();
+}
+
+async function rollback() {
+  const data = await postJson("/api/actions/rollback", {
+    execution_id: lastExecution.execution_id,
+    principal_id: $("approver") ? $("approver").value : $("principal").value
+  });
+  renderAction(
+    Object.assign({}, lastProposal, { state: "executed" }),
+    data.refused
+      ? `<div class="refused"><span class="code">${escapeHtml(data.reason)}</span>
+         <div class="meta">${escapeHtml(data.explanation)}</div></div>`
+      : `<h2 style="margin-top:16px">Rolled back</h2>
+         <div class="record"><div class="mono">${escapeHtml(JSON.stringify(data.result))}</div></div>`
+  );
+  await renderLineage();
+  await renderOpsState();
+}
+
+async function renderOpsState() {
+  const data = await (await fetch("/api/state")).json();
+  const table = (name, rows) => {
+    if (!rows.length) return `<p class="meta">${name}: empty</p>`;
+    const columns = Object.keys(rows[0]);
+    return `<h2 style="margin-top:14px">${name}</h2><table>
+      <tr>${columns.map(c => `<th>${escapeHtml(c)}</th>`).join("")}</tr>
+      ${rows.map(row => `<tr>${columns.map(c =>
+        `<td class="mono">${escapeHtml(row[c])}</td>`).join("")}</tr>`).join("")}
+    </table>`;
+  };
+  $("ops-state").innerHTML =
+    table("customers", data.customers) +
+    table("tickets", data.tickets) +
+    table("refunds", data.refunds) +
+    table("messages", data.messages);
+}
+
 async function renderLineage() {
-  const data = await (await fetch("/api/lineage")).json();
+  const data = await (await fetch("/api/lineage?limit=12")).json();
   const rows = data.entries.slice().reverse().map(e => `
     <tr>
       <td class="mono">${e.seq}</td>
-      <td class="mono">${escapeHtml(e.principal_id)}</td>
-      <td class="mono">${escapeHtml(e.purpose)}</td>
-      <td>${escapeHtml(e.question)}</td>
-      <td class="mono">${e.returned}</td>
-      <td class="mono">${e.withheld.map(w => w.count + "x" + w.reason).join(", ")}</td>
+      <td class="mono">${escapeHtml(e.kind)}</td>
+      <td class="mono">${escapeHtml(e.principal_id || "")}</td>
+      <td class="mono">${escapeHtml(e.purpose || "")}</td>
+      <td>${escapeHtml(e.detail || "")}</td>
+      <td class="mono">${e.returned || ""}</td>
+      <td class="mono">${(e.withheld || []).map(w => w.count + "x" + w.reason).join(", ")}</td>
       <td class="mono">${escapeHtml(e.hash)}</td>
     </tr>`).join("");
 
-  document.getElementById("lineage").innerHTML = `
+  $("lineage").innerHTML = `
     <p class="meta">Chain integrity:
       <span class="${data.chain_intact ? "ok" : ""}">${
         data.chain_intact ? "intact" : "BROKEN"}</span>
-      &mdash; every query, including every denial, is one hash-chained line.</p>
+      &mdash; reads and actions share one hash chain, including every refusal.</p>
     <table>
-      <tr><th>#</th><th>principal</th><th>purpose</th><th>question</th>
+      <tr><th>#</th><th>kind</th><th>principal</th><th>purpose</th><th>detail</th>
           <th>returned</th><th>withheld</th><th>hash</th></tr>
       ${rows}
     </table>`;
