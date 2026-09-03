@@ -373,6 +373,97 @@ policy matching what the page actually loads, and two probes that answer differe
 questions — `/healthz` says the process is up, `/readyz` says a governed request can
 actually be served and the audit chain still verifies.
 
+### Identity from your existing IdP
+
+A static principals file suits one process serving one identity. When a gateway
+fronts many users, verify the tokens your organization already issues:
+
+```bash
+pip install "aperture-plane[idp]"
+
+aperture serve -w workspace -p unused \
+  --jwks-url https://acme.okta.example/oauth2/default/v1/keys \
+  --issuer https://acme.okta.example/oauth2/default \
+  --audience aperture
+```
+
+Works with Okta, Entra, Auth0, Keycloak, or anything else publishing a JWKS
+endpoint. Issuer and audience are verified, keys are cached and refetched on an
+unknown `kid`, and tokens are single use when they carry a `jti`.
+
+**The algorithm is fixed by policy and never read from the token.** Honouring a
+token's own `alg` is the JWT confusion attack — flip it to `HS256` and sign with
+the public key as if it were a shared secret. `tests/test_jwks.py` performs that
+exact forgery and asserts it fails.
+
+### Actions against real systems
+
+`HttpExecutor` calls an external service for the three phases, which is the shape
+of every real integration:
+
+```yaml
+- id: ops.refund
+  executor: http
+  effect_class: financial
+  reversible: true
+  config:
+    estimate_url: https://ops.internal.example/refunds/estimate
+    execute_url: https://ops.internal.example/refunds
+    compensate_url: https://ops.internal.example/refunds/reverse
+    auth_env: OPS_API_TOKEN        # named here, never written here
+    timeout_seconds: 10
+```
+
+Standard library only. Redirects are refused — a 302 is how an SSRF turns one
+allowlisted URL into an arbitrary one, and the test points the redirect at the
+cloud metadata endpoint to prove it. Plaintext HTTP to a non-local host is
+refused. An action declared reversible that returns no compensation record fails
+loudly, because the approval screen already promised an undo.
+
+### Operations
+
+```
+GET /healthz    liveness  - the process is up
+GET /readyz     readiness - a governed request can be served, chain verifies
+GET /metrics    Prometheus text
+```
+
+Logs are JSON on stderr with reason codes as queryable fields:
+
+```json
+{"ts":"2026-09-03T19:42:24.369Z","level":"info","event":"context.search",
+ "purpose":"customer_support","returned":1,
+ "withheld":[{"reason":"purpose_not_permitted","count":3}],"duration_ms":20.53}
+```
+
+Retrieved content, action arguments, and assertion tokens are **dropped from logs
+entirely**, not truncated — the start of a document is usually the part that
+identifies it. Metric labels come only from purposes, action ids, and reason codes,
+never from user input, so nobody can inflate cardinality until the metrics store
+falls over.
+
+### Containers
+
+```bash
+docker compose up --build      # playground on :8000
+```
+
+Non-root, multi-stage, workspace mounted as a volume so a policy fix does not need
+a rebuild. CI builds the image, asserts it is not running as root, and proves both
+the HTTP surface and the MCP stdio server work inside it.
+
+---
+
+## For security and compliance reviewers
+
+- **[Threat model](docs/THREAT_MODEL.md)** — trust boundaries, five adversaries,
+  26 attacks each mapped to the test that covers it, and the residual risk.
+- **[Control mapping](docs/COMPLIANCE.md)** — EU AI Act Articles 10/12/14, GDPR,
+  NIST AI RMF, ISO 42001, SOC 2. Written to state what it does *not* cover as
+  plainly as what it does. It is a map to evidence, not a compliance claim.
+- **[Security policy](SECURITY.md)** — the eleven properties whose violation counts
+  as a vulnerability, and how to report one.
+
 ---
 
 ## Try it in a browser
@@ -606,7 +697,7 @@ pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-198 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
+249 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
 
 - **`tests/test_conformance.py`** — a policy conformance matrix asserting, for every
   (principal, purpose) pair, exactly which sources are readable. Read it as the

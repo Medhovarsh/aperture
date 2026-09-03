@@ -576,9 +576,28 @@ INDEX_HTML = """<!doctype html>
     font: 15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
   .wrap { max-width: 1040px; margin: 0 auto; padding: 32px 20px 72px; }
-  header h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -0.02em; }
-  header p { margin: 0 0 4px; color: var(--muted); }
-  header a { color: var(--accent); }
+  .hero { padding: 22px 0 26px; border-bottom: 1px solid var(--line); margin-bottom: 22px; }
+  .eyebrow { margin: 0 0 12px; font-size: 12px; text-transform: uppercase;
+             letter-spacing: 0.08em; color: var(--muted); }
+  .hero h1 { margin: 0 0 14px; font-size: 34px; line-height: 1.2;
+             letter-spacing: -0.03em; font-weight: 700; }
+  .lede { margin: 0 0 18px; font-size: 16px; color: var(--muted); max-width: 62ch; }
+  .cta { display: flex; gap: 10px; flex-wrap: wrap; }
+  .button {
+    display: inline-block; padding: 9px 16px; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--panel); color: var(--ink);
+    text-decoration: none; font-size: 14px; font-weight: 600;
+  }
+  .button.primary-link { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .pillars { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+             gap: 14px; margin-bottom: 24px; }
+  .pillar { background: var(--panel); border: 1px solid var(--line);
+            border-radius: 10px; padding: 16px 18px; }
+  .pillar h3 { margin: 0 0 8px; font-size: 15px; }
+  .pillar p { margin: 0; font-size: 13.5px; color: var(--muted); }
+  .pillar code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  .anchor { scroll-margin-top: 20px; }
+  @media (max-width: 600px) { .hero h1 { font-size: 26px; } }
   .note {
     margin: 18px 0 20px; padding: 10px 14px; border-left: 3px solid var(--accent);
     background: var(--panel); color: var(--muted); font-size: 13.5px; border-radius: 0 6px 6px 0;
@@ -654,11 +673,49 @@ INDEX_HTML = """<!doctype html>
 </head>
 <body>
 <div class="wrap">
-  <header>
-    <h1>Aperture</h1>
-    <p>A governed context plane for AI agents. Denial is explainable, never silent.</p>
-    <p><a href="https://github.com/Medhovarsh/aperture">github.com/Medhovarsh/aperture</a></p>
+  <header class="hero">
+    <p class="eyebrow">Open source &middot; Apache-2.0 &middot; no paid dependencies</p>
+    <h1>Agents can't be trusted with your data<br>until you can prove what they saw.</h1>
+    <p class="lede">
+      Aperture is the chokepoint enterprise agents read and act through. It knows what
+      the data means, who may see it, how fresh it is &mdash; and how to explain a refusal
+      instead of silently returning less.
+    </p>
+    <div class="cta">
+      <a class="button primary-link" href="#try">Try it below</a>
+      <a class="button" href="https://github.com/Medhovarsh/aperture">GitHub</a>
+      <a class="button" href="https://github.com/Medhovarsh/aperture/blob/main/docs/THREAT_MODEL.md">Threat model</a>
+      <a class="button" href="https://github.com/Medhovarsh/aperture/blob/main/docs/COMPLIANCE.md">Control mapping</a>
+    </div>
   </header>
+
+  <section class="pillars">
+    <div class="pillar">
+      <h3>Denial is explainable</h3>
+      <p>
+        Today an agent without permission just gets fewer chunks and answers
+        confidently anyway. Aperture returns the reason codes and tells the model to
+        disclose them.
+      </p>
+    </div>
+    <div class="pillar">
+      <h3>Actions are priced first</h3>
+      <p>
+        <code>region=legacy</code> is one short string. It is also 7 deleted accounts
+        and $10,320. The blast radius is measured against real state before anything
+        runs &mdash; never asserted by the agent.
+      </p>
+    </div>
+    <div class="pillar">
+      <h3>The audit survives an auditor</h3>
+      <p>
+        Every read and every refusal is one hash-chained line. Signed checkpoints
+        detect a wholesale rewrite, which a plain log cannot.
+      </p>
+    </div>
+  </section>
+
+  <div class="anchor" id="try"></div>
 
   <div class="tabs" role="tablist">
     <button id="tab-read" role="tab" aria-selected="true">Reads</button>
