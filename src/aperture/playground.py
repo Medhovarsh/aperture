@@ -35,7 +35,7 @@ import uuid
 from collections import OrderedDict, deque
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -104,15 +104,22 @@ class SessionPool:
 
 
 class RateLimiter:
-    """Fixed-window request counter, keyed by session."""
+    """Sliding-window request counter, keyed by session.
 
-    def __init__(self) -> None:
+    The clock is injectable so behaviour at a window boundary can be tested
+    deterministically. Asserting an exact request count against a real clock is a
+    flaky test by construction: a slow run spans the window and the limiter
+    correctly lets more requests through.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._hits: dict[tuple[str, str], deque[float]] = {}
         self._lock = threading.Lock()
+        self._clock = clock
 
     def allow(self, key: str, bucket: str, limit: int, window: float) -> bool:
         """Record a hit and report whether it is within the limit."""
-        now = time.monotonic()
+        now = self._clock()
         with self._lock:
             hits = self._hits.setdefault((key, bucket), deque())
             while hits and now - hits[0] > window:

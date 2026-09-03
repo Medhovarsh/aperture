@@ -20,7 +20,9 @@ from aperture import playground  # noqa: E402
 def client(tmp_path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """A client with its own session pool rooted in a temp directory."""
     monkeypatch.setattr(playground, "sessions", playground.SessionPool(tmp_path / "sessions"))
-    monkeypatch.setattr(playground, "limiter", playground.RateLimiter())
+    # A frozen clock keeps window-boundary assertions deterministic; a real clock
+    # makes them fail whenever the suite runs slowly.
+    monkeypatch.setattr(playground, "limiter", playground.RateLimiter(clock=lambda: 1000.0))
     return TestClient(playground.app)
 
 
@@ -257,7 +259,7 @@ def test_visitors_do_not_share_state(tmp_path, monkeypatch: pytest.MonkeyPatch) 
     A shared workspace would also mean a shared rate limit and a shared audit log.
     """
     monkeypatch.setattr(playground, "sessions", playground.SessionPool(tmp_path / "s"))
-    monkeypatch.setattr(playground, "limiter", playground.RateLimiter())
+    monkeypatch.setattr(playground, "limiter", playground.RateLimiter(clock=lambda: 1000.0))
     first, second = TestClient(playground.app), TestClient(playground.app)
 
     proposal = first.post(
@@ -331,3 +333,26 @@ def test_reads_and_actions_have_separate_budgets(client: TestClient) -> None:
             },
         )
     assert client.get("/api/identities").status_code == 200
+
+
+def test_rate_limit_window_rolls_over(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Past the window, the allowance returns. Verified with a controlled clock."""
+    now = {"t": 0.0}
+    monkeypatch.setattr(playground, "sessions", playground.SessionPool(tmp_path / "s"))
+    monkeypatch.setattr(
+        playground, "limiter", playground.RateLimiter(clock=lambda: now["t"])
+    )
+    client = TestClient(playground.app)
+    payload = {
+        "principal_id": "svc_support_agent",
+        "purpose": "customer_support",
+        "action_id": "support.close_ticket",
+        "arguments": {"ticket_id": "tkt-1180"},
+    }
+
+    for _ in range(playground.ACTION_LIMIT):
+        assert client.post("/api/actions/propose", json=payload).status_code == 200
+    assert client.post("/api/actions/propose", json=payload).status_code == 429
+
+    now["t"] += playground.ACTION_WINDOW + 1
+    assert client.post("/api/actions/propose", json=payload).status_code == 200

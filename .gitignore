@@ -9,3 +9,6 @@ build/
 .aperture/
 demo_state/
 .coverage
+
+.vercel
+.env*

@@ -148,3 +148,48 @@ def test_stranded_proposals_are_surfaced_to_operators(
 
     stranded = workspace.action_store.stuck_executions(older_than_seconds=-1)
     assert [p.id for p in stranded] == [proposal.id]
+
+
+def test_lineage_chain_survives_concurrent_writes(workspace: Workspace) -> None:
+    """The audit log must not fork or tear when many actions run at once.
+
+    Appending reads the head hash, chains to it, and writes. Unserialized, two
+    threads read the same head and chain two entries to the same predecessor, and a
+    reader can catch a line mid-write. Either way the chain stops verifying, which
+    would make the audit trail worthless exactly when it matters most.
+    """
+    log = workspace.lineage
+
+    def write(index: int) -> None:
+        for step in range(6):
+            log.append({"kind": "test_event", "principal_id": f"worker-{index}", "step": step})
+
+    with ThreadPoolExecutor(max_workers=THREADS) as pool:
+        list(pool.map(write, range(THREADS)))
+
+    entries = list(log.read_all())
+    assert len(entries) == THREADS * 6
+
+    # Sequence numbers must be a gapless run, and the chain must verify.
+    assert [entry["seq"] for entry in entries] == list(range(1, THREADS * 6 + 1))
+    ok, problems = log.verify()
+    assert ok, problems
+
+
+def test_concurrent_actions_keep_the_audit_chain_intact(
+    gateway: ActionGateway, workspace: Workspace
+) -> None:
+    """The realistic version: many agents acting at once, one coherent audit trail."""
+    def act(index: int):
+        proposal = gateway.propose(
+            "svc_support_agent", "customer_support", "support.refund",
+            {"customer_id": "cus-5510", "amount": 1.0},
+        )
+        if isinstance(proposal, Proposal):
+            gateway.execute(proposal.id, "svc_support_agent")
+
+    with ThreadPoolExecutor(max_workers=THREADS) as pool:
+        list(pool.map(act, range(THREADS)))
+
+    ok, problems = workspace.lineage.verify()
+    assert ok, problems

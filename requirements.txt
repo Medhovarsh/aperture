@@ -1,6 +1,10 @@
-# Dependencies for the Vercel playground deployment.
-# The trailing "." installs the aperture package itself from pyproject.toml.
+# Runtime dependencies for the Vercel playground function.
+#
+# Deliberately does NOT install the project itself (no "." line). Doing so made the
+# build resolve dependencies from pyproject.toml, where fastapi is an optional
+# extra, so the web deps never got installed and the function failed to import.
+# The aperture package reaches the function through includeFiles in vercel.json
+# instead, which is explicit about what ships.
 fastapi>=0.110
 pydantic>=2.6
 pyyaml>=6.0
-.

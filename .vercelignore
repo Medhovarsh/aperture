@@ -1,0 +1,11 @@
+# Only the package and its entrypoint need to reach the function bundle.
+tests/
+docs/
+examples/
+tools/
+demo_state/
+ci_workspace/
+.github/
+.pytest_cache/
+__pycache__/
+*.pyc

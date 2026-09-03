@@ -5,6 +5,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-stdio%20server-8A2BE2.svg)](https://modelcontextprotocol.io)
 [![Dependencies](https://img.shields.io/badge/paid%20dependencies-none-brightgreen.svg)](#)
+[![Live demo](https://img.shields.io/badge/live%20demo-aperture--eight--bice.vercel.app-2f5bd7.svg)](https://aperture-eight-bice.vercel.app)
 
 **A governed context plane for AI agents.**
 
@@ -16,6 +17,10 @@ to undo what it did.
 
 Runs as an MCP server. Zero paid dependencies, no model API key, no vector database,
 no cloud account. It installs inside a locked-down network.
+
+**Live demo: https://aperture-eight-bice.vercel.app** — pick an identity, ask a
+question, propose an action, watch the blast radius get priced and the approval get
+demanded. All data is synthetic; every visitor gets an isolated session.
 
 ![Same question, two purposes, two different answers](docs/demo.svg)
 
@@ -261,6 +266,115 @@ the workspace refuses to load.
 
 ---
 
+## Running it in production
+
+The demo is honest about being a demo. These are the parts that exist because a
+real deployment needs them.
+
+### Executing an approval is an atomic claim
+
+An earlier version of this code lost money in a test. Eight concurrent `execute`
+calls on one approved 50 USD refund each passed the state check before any of them
+wrote back, and eight refunds were issued:
+
+```
+REFUND ROWS WRITTEN: [(1, 50.0), (2, 50.0), ... (8, 50.0)]
+TOTAL REFUNDED: 400.0     VERDICT: DOUBLE SPEND
+```
+
+State now lives in SQLite, and execution begins with a single conditional UPDATE
+that moves a proposal from `ready` to `executing`. Exactly one caller can win it.
+The losers are told `proposal_in_flight`. Same treatment for rollback, so two
+callers cannot both reverse one refund. `tests/test_concurrency.py` runs the
+original attack.
+
+The same test suite caught a second race: appending to the audit log reads the
+head hash, chains to it, and writes, and unserialized that let two threads chain
+entries to the same predecessor, forking the chain. Appends are now serialized per
+file. An audit log that corrupts under concurrent writes is worthless exactly when
+it matters most.
+
+**A proposal stranded in `executing` is never retried automatically.** If an
+executor dies mid-call, whether the action took effect is unknown, and a machine
+cannot safely choose between retrying and giving up. `aperture actions stuck`
+surfaces them for a person.
+
+### Budgets, not just limits
+
+Per-call ceilings leave the obvious hole open: a hundred separately-legal 100 USD
+refunds are still 10,000 USD, and an agent in a retry loop finds that out faster
+than a human does.
+
+```yaml
+- id: support-small-refunds
+  effect: allow
+  when: {groups: [support], purposes: [customer_support], actions: [support.refund]}
+  max_amount: 100                # per call
+  window_seconds: 3600           # rolling window
+  max_amount_per_window: 500     # total across the window
+  max_actions_per_window: 5
+```
+
+Budgets are re-checked at execution, not only at proposal. A rolled-back action
+still consumes budget, because it really did move money twice.
+
+### Identity from a gateway, not a file
+
+A static principals file suits one process serving one identity. When a gateway
+fronts many users, something has to carry "this is Kim, acting for customer
+support" across a process boundary without letting the agent choose the answer.
+
+```bash
+export APERTURE_SIGNING_SECRET=...
+aperture assertion -p u_kim --purpose customer_support     # issuer side
+aperture serve -w workspace -p unused --signing-secret-env APERTURE_SIGNING_SECRET
+```
+
+Assertions are HMAC-SHA256, expire in seconds, and are single use — the `jti` is
+recorded, so a captured token cannot be replayed inside its window. **The purpose is
+inside the signature**, so a caller that passes `purpose: hr_support` alongside a
+token minted for customer support does not get the escalation:
+
+```
+first use of token 1                       -> ok
+replay of token 1                          -> ERROR assertion_replayed
+token 2 + caller tries purpose=hr_support  -> ok, but served as customer_support
+```
+
+`AssertionVerifier` is the seam where RS256/JWKS verification drops in. HMAC is what
+ships, because it needs no cryptography dependency.
+
+### An audit log you can prove was not rewritten
+
+A hash chain catches edits. It cannot catch someone with write access rewriting the
+whole file consistently — recomputation still passes. Checkpoints close that:
+
+```bash
+aperture lineage -w workspace checkpoint --secret-env APERTURE_ANCHOR_SECRET
+aperture lineage -w workspace verify --secret-env APERTURE_ANCHOR_SECRET
+```
+
+```
+LINEAGE CHAIN BROKEN (1 problem(s)):
+  log has been truncated: checkpoint covers seq 14, which is missing
+```
+
+Ship checkpoints somewhere the log's writer cannot reach. Anchoring to a secret that
+an attacker with write access can also read proves nothing.
+
+`aperture lineage export` emits newline-delimited JSON, which every SIEM ingests
+without a custom parser.
+
+### Serving the playground
+
+Per-visitor session isolation with LRU eviction (a crawler cannot fill the disk one
+session at a time), separate rate limits for reads and actions, a content security
+policy matching what the page actually loads, and two probes that answer different
+questions — `/healthz` says the process is up, `/readyz` says a governed request can
+actually be served and the audit chain still verifies.
+
+---
+
 ## Try it in a browser
 
 A hosted playground ships in the repo, covering both halves of the plane.
@@ -283,10 +397,17 @@ uvicorn aperture.playground:app --reload
 Deploy it anywhere that runs a Python function. For Vercel:
 
 ```bash
-npm i -g vercel && vercel deploy
+vercel deploy --prod
 ```
 
 `vercel.json` and `api/index.py` are already wired; the whole app is one function.
+
+Two things that bit during the first deploy, documented so they do not bite again:
+Vercel's Python builder uses `uv` with `pyproject.toml` and ignores `requirements.txt`,
+so the function came up without FastAPI (an optional extra there) until `installCommand`
+forced pip. And a catch-all rewrite to `/api/index` rewrites the path the app receives,
+turning `/healthz` into a 404 — the FastAPI preset already routes every path to the ASGI
+app, so no rewrite is needed.
 
 The playground deliberately does the two things the real deployment refuses to do: it
 lets **you** choose which principal to act as, and it exposes approval over HTTP. That
@@ -443,6 +564,13 @@ Enforced today:
 - **Tenant isolation** is the first gate and is unconditional.
 - **Action authority is separate from read authority**, and impact limits are
   evaluated against a measured blast radius rather than the agent's claim.
+- **Executing an approval is atomic.** Concurrent callers cannot both act on one
+  approval, and a failed execution is parked for a human rather than retried.
+- **Aggregate spend and rate ceilings** bound what a compromised or looping agent
+  can do in total, not merely per call.
+- **Caller assertions are signed, short-lived, and single use**, with the purpose
+  inside the signature.
+- **Executor faults become reason codes**, never propagating exceptions.
 
 The red-team suite (`tests/test_redteam.py`) probes each of these, including a poisoned
 document that instructs the system to override policy, an agent trying to approve its
@@ -452,20 +580,22 @@ and nothing an attacker can write into an index participates in that decision.
 
 ### What is *not* claimed
 
-- **The lineage log is tamper-evident, not tamper-proof.** Someone with write access can
-  rewrite the whole file consistently. Detecting that needs the head hash anchored
-  somewhere they do not control. Not built.
-- **Single node.** Proposals and executions live in a JSON file with atomic writes.
-  That is enough for one process; a multi-node deployment needs a real store and
-  locking, which is not built.
+- **Single host, not distributed.** SQLite in WAL mode makes execution atomic across
+  threads and processes on one machine. Several machines sharing one workspace need
+  Postgres behind the same `ActionStore` interface; that has not been built.
 - **Executors are demo implementations.** They operate on a local SQLite database.
-  Pointing them at Stripe or Zendesk is a rewrite of one file, but it has not been
-  done here.
-- **Identity is a static file.** The registry sits behind an interface so an IdP can
-  back it later; no IdP integration ships today.
+  The `Executor` interface is the seam for Stripe or Zendesk, and the exception
+  boundary already treats executors as untrusted, but no real integration ships.
+- **Assertions are HMAC, not public-key.** Issuer and verifier share a secret. An
+  RS256/JWKS verifier fits behind `AssertionVerifier` without touching anything else.
+  There is no SCIM or directory sync: principals still come from a file.
+- **Checkpoints must be shipped off-box to mean anything.** Aperture writes and
+  verifies them; getting them somewhere the log's writer cannot reach is deployment
+  work this repo does not do for you.
 - **Retrieval is lexical BM25.** Deliberate — it makes the plane installable with no
   model download. Swap in a real embedding index without touching any other module.
-- **No web dashboard.** `aperture explain` and `aperture lineage` cover the operator loop.
+- **No web dashboard.** `aperture explain`, `aperture lineage`, and `aperture actions
+  stuck` cover the operator loop.
 
 ---
 
@@ -476,7 +606,7 @@ pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-159 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
+198 tests, run on Python 3.10-3.13 plus Windows and macOS by CI. The two that matter most:
 
 - **`tests/test_conformance.py`** — a policy conformance matrix asserting, for every
   (principal, purpose) pair, exactly which sources are readable. Read it as the

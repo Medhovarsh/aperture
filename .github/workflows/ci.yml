@@ -157,3 +157,80 @@ jobs:
           assert not (names & forbidden), names & forbidden
           print('MCP contract OK:', sorted(names))
           "
+
+  production-controls:
+    name: production controls
+    runs-on: ubuntu-latest
+    env:
+      APERTURE_SIGNING_SECRET: ci-signing-secret-long-enough
+      APERTURE_ANCHOR_SECRET: ci-anchor-secret-long-enough
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+
+      - name: Build workspace
+        run: aperture demo --path ci_workspace
+
+      - name: Rolling-window budget must stop a retry loop
+        run: |
+          set -euo pipefail
+          executed=0
+          for i in 1 2 3 4 5 6 7; do
+            if aperture actions -w ci_workspace propose support.refund \
+                -p svc_support_agent --purpose customer_support \
+                --arg customer_id=cus-5510 --arg amount=90 > proposal.txt 2>/dev/null; then
+              PID=$(grep -o 'prp_[a-f0-9]*' proposal.txt | head -1)
+              aperture actions -w ci_workspace execute "$PID" -p svc_support_agent > /dev/null
+              executed=$((executed + 1))
+            fi
+          done
+          echo "executed $executed of 7 attempts"
+          # 5 x 90 = 450 USD; a sixth would breach the 500 USD hourly ceiling.
+          test "$executed" -eq 5 || { echo "budget ceiling not enforced"; exit 1; }
+
+      - name: Signed assertions must be single use
+        run: |
+          set -euo pipefail
+          TOKEN=$(aperture assertion -p u_kim --purpose customer_support)
+          python - "$TOKEN" <<'PYCHECK' > requests.jsonl
+          import json, sys
+          token = sys.argv[1]
+          for message_id in (1, 2):
+              print(json.dumps({
+                  "jsonrpc": "2.0",
+                  "id": message_id,
+                  "method": "tools/call",
+                  "params": {
+                      "name": "context_search",
+                      "arguments": {"question": "refund window", "assertion": token},
+                  },
+              }))
+          PYCHECK
+          aperture serve -w ci_workspace -p unused \
+            --signing-secret-env APERTURE_SIGNING_SECRET < requests.jsonl > replies.jsonl
+          python - <<'PYCHECK'
+          import json
+          replies = [json.loads(line) for line in open("replies.jsonl")]
+          first, second = (json.loads(r["result"]["content"][0]["text"]) for r in replies)
+          assert "error" not in first, first
+          assert "assertion_replayed" in second.get("error", ""), second
+          print("single-use assertions OK")
+          PYCHECK
+
+      - name: Anchored audit log must detect a wholesale rewrite
+        run: |
+          set -euo pipefail
+          aperture lineage -w ci_workspace checkpoint --secret-env APERTURE_ANCHOR_SECRET
+          aperture lineage -w ci_workspace verify --secret-env APERTURE_ANCHOR_SECRET
+          : > ci_workspace/lineage/access.jsonl
+          if aperture lineage -w ci_workspace verify --secret-env APERTURE_ANCHOR_SECRET; then
+            echo "a rewritten log still verified" && exit 1
+          fi
+          echo "rewrite detected"

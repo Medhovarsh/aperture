@@ -26,12 +26,35 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 GENESIS_HASH = "0" * 64
+
+# Appending is read-then-write: the head hash is read, the new entry is chained to
+# it, and the line is written. Those three steps have to be one critical section.
+# Without it two threads read the same head and chain two entries to the same
+# predecessor - the chain forks and verification fails - and a reader can catch a
+# line mid-write. An audit log that corrupts under concurrent writes is worthless.
+#
+# Locks are keyed by resolved path rather than held on the instance, because
+# Workspace.lineage returns a fresh LineageLog on every access.
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    """Return the shared append lock for a log file."""
+    key = str(path.resolve())
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _LOCKS[key] = lock
+        return lock
 
 
 def _canonical(payload: dict[str, Any]) -> str:
@@ -65,19 +88,23 @@ class LineageLog:
         The write is flushed and fsynced before returning, so a crash cannot lose an
         access record that a caller was already told about.
         """
-        prev_hash, seq = self._head()
-        entry = {
-            "seq": seq + 1,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            **payload,
-            "prev_hash": prev_hash,
-        }
-        entry["hash"] = compute_hash(entry, prev_hash)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, default=str) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        return entry
+        with _lock_for(self.path):
+            prev_hash, seq = self._head()
+            entry = {
+                "seq": seq + 1,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                **payload,
+                "prev_hash": prev_hash,
+            }
+            entry["hash"] = compute_hash(entry, prev_hash)
+            # One write call for the whole line, then flush and fsync, so a reader
+            # never sees half an entry and a crash cannot lose an access record the
+            # caller was already told about.
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return entry
 
     def _head(self) -> tuple[str, int]:
         """Return the hash and sequence number of the last entry."""
@@ -97,8 +124,15 @@ class LineageLog:
         with self.path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     yield json.loads(line)
+                except json.JSONDecodeError:
+                    # A torn line can only be the last one, written by a process
+                    # this lock does not cover. Stop rather than guess: verifying
+                    # against checkpoints then reports the chain as short.
+                    return
 
     def find(self, trace_id: str) -> dict[str, Any] | None:
         """Return the entry for a trace id, or None."""
